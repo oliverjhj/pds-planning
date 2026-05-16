@@ -1,10 +1,15 @@
 # WORKFLOW.md
 # Passenger Display System (PDS) — Operating Manual
 
-**Version:** 3.7
+**Version:** 3.8
 **Last Updated:** May 2026
 
 ## Changelog
+
+### v3.8 (May 2026)
+Round-2 post-adversarial-review close-out additions.
+- §13.7 (new): CLAUDE.md propagation is a mandatory close-out for any frozen-doc re-planning. Codifies the rule that frozen status does not re-engage until the relevant CLAUDE.md files are synced and version-bumped to match the frozen suite. Lesson learned from round-2 adversarial finding 1 (CLAUDE.md drift across the entire round-1 v3.0 → v3.7 campaign).
+- §14 (new): Round-2 Lessons. Captures the value of (a) "report contradictions, don't silently fix them" prompt discipline, (b) running adversarial review on planning artefacts before unfreezing for build, and (c) deciding review cadence round-by-round rather than committing upfront.
 
 ### v3.7 (May 2026)
 Post-adversarial-review re-planning pass, item 7 of 7 (compliance, WORKFLOW, smaller items, and campaign close-out).
@@ -553,6 +558,34 @@ A future contributor reading the project should be able to read the frozen docum
 If the frozen documents *do* need to change (case 1 above), the new version increments the document's version number (e.g., PRD v3.0 → PRD v3.1). The old version is preserved in git history. The Claude Project knowledge is updated with the new version.
 
 This happens at re-planning time, never mid-build. There is no concept of "the architect quietly updated PRD.md to match what we ended up building" — if the agreement changes, it changes deliberately, and the version number reflects that.
+
+### 13.7 CLAUDE.md Propagation is a Mandatory Close-Out
+
+Any re-planning event that bumps the version of any frozen document MUST include, as the final task of that event, a sweep of the relevant CLAUDE.md file(s) to mirror the frozen-doc changes. **Frozen status does not re-engage** until that sweep is done and the CLAUDE.md files carry the same version number as the frozen documents.
+
+**Why.** The builder reads only CLAUDE.md (§1.2). If CLAUDE.md lags the frozen suite, the builder will scaffold features the frozen docs have cut, omit features the frozen docs have added, and enforce rules that no longer match reality. The round-2 adversarial review identified exactly this drift: the CLAUDE.md files had not been touched across the entire round-1 v3.0 → v3.7 campaign and would, on day one of the build, have instructed the builder to bundle NaPTAN, build upload-sync, support Kiosk Level 2, frame approval as a boolean, and call a deprecated audio-render Edge Function — all contradicted by the frozen suite. The propagation rule exists to make that failure structurally impossible in future rounds.
+
+**How to apply.** A re-planning event's task list is not complete until:
+
+1. Every frozen-doc change has been classified as "affects Android CLAUDE.md", "affects dashboard CLAUDE.md", "affects both", or "no CLAUDE.md impact". This classification is explicit, not implicit.
+2. The affected CLAUDE.md files have been edited to reflect the changes — architectural rules updated, added, or removed; project structure refreshed; gotchas added; data decisions reflected; coordination lists updated; setup notes added for any new manual steps.
+3. Both CLAUDE.md files have been version-bumped to the same version number as the frozen suite, with a changelog entry summarising the sweep. The bump applies even to the CLAUDE.md file with "no impact" — keeping all four documents at the same version number is itself a useful invariant.
+
+Only then does the frozen-documents rule re-engage. **A re-planning campaign that ends without a CLAUDE.md sweep is, by definition, incomplete.**
+
+The architect is responsible for both producing the sweep task (typically as the final task of the campaign) and verifying that the sweep is comprehensive before declaring the campaign closed. The "frozen-doc cross-reference grep" — searching the frozen suite for every term the sweep was supposed to address and confirming no stale wording remains — is part of the close-out.
+
+---
+
+## 14. Round-2 Lessons
+
+Two operational practices proved their value in the round-2 campaign and warrant codifying so future rounds preserve them.
+
+**Contradictions are reported, not silently fixed, inside a task.** Each round-2 task prompt instructed the author to report contradictions found in adjacent documents but defer their resolution to a dedicated close-out task. This kept individual prompts narrowly scoped and prevented the "while I'm in here" mission-creep that bloated some round-1 tasks. The cost was one extra close-out task per round; the benefit was that no task ever silently rewrote something outside its declared scope, and every contradiction was resolved with deliberate cross-document attention rather than as a side effect of a single-document edit.
+
+**Adversarial review of planning artefacts is run before any build, not after.** Round 1 produced v3.7. The round-2 adversarial review caught significant issues that would otherwise have surfaced as build-time defects: CLAUDE.md drift, heartbeat ownership confusion, audio pipeline cost/latency assumptions, FCM-render race, divergence-detection trigger-happiness. The cost of finding those in planning is hours; the cost of finding them in build is days plus throwaway code. Run the adversarial pass before unfreezing for build, and run it against the **complete** package including the CLAUDE.md files and CONTEXT.md — not just the four formally-frozen documents.
+
+**Review cadence is decided round-by-round.** The team did not commit upfront to a fixed number of adversarial-review rounds. Each round's output was evaluated on its own merits; the decision to run a round 3 (or not) is made after round 2's deliverables are in hand. A round that yields a single small finding may not justify a follow-up; a round that yields structural rework usually does. Don't pre-commit to a cadence; let the findings drive it.
 
 ---
 

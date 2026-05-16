@@ -1,13 +1,22 @@
 # CLAUDE.md
 # Passenger Display System (PDS) — Android Application
 
+**Version:** 3.8 (May 2026)
+
 This file is your reference for working on the PDS Android application. Read it at the start of every session. It contains conventions, architectural rules, and known gotchas. If a rule here conflicts with a prompt, ask before deviating.
+
+## Changelog
+
+### v3.8 (May 2026)
+Previously unversioned. Brought into sync with the v3.8 planning suite via the round-2 close-out sweep. Reflects all round-1 (PRD/Data-Arch/Compliance v3.0 → v3.7) and round-2 (v3.7 → v3.8) decisions that had never propagated into CLAUDE.md. Substantive deltas — itemised in "Sweep summary" at the end of this file — include: bundled tablet NaPTAN removed; upload-sync scaffolding removed; Kiosk Level 2 deferred (Level 1 is the initial release); on-device TTS forbidden, pre-rendered MP3 pipeline documented; per-stop proximity radius + two-stop look-ahead + GPS accuracy gate; `audio_render_status` journey-start gate; per-device `audio_enabled` with honest one-per-bus framing; heartbeat moved to lifecycle ownership (`HeartbeatController` + `ProcessLifecycleOwner`); JWT custom-claims contract for RLS; `devices.activation_state` rename; operator-status enum with suspension-at-journey-end; `journey_summaries_pending` outbox; `journey_state` staleness recovery; FR-AT-65 visual flash co-equal with the audio chime; FR-AT-67 GMS detection; FR-AT-04 transient vs terminal recovery; FCM data-only payload; `device_secret` in EncryptedSharedPreferences; manual custom-access-token-hook setup; Sentry crash telemetry.
 
 ---
 
 ## What This Project Is
 
 A native Android tablet application that displays passenger information on UK buses operating rail replacement services. It runs in kiosk mode, tracks GPS, plays pre-rendered audio announcements from local files, and operates fully offline during journeys. It is paired with a web dashboard (separate repository) where bus operators author routes and manage their fleet.
+
+The tablet does not author routes. It does not synthesise audio. It does not hold a NaPTAN database. Those concerns live on the dashboard or in the server-side render pipeline; the tablet is a display and stop-detection device that consumes pre-rendered artefacts.
 
 The product is legally regulated under the UK Public Service Vehicles (Accessible Information) Regulations 2023. Several rules in this document exist because of those regulations.
 
@@ -22,12 +31,14 @@ The product is legally regulated under the UK Public Service Vehicles (Accessibl
 - **Async:** Kotlin Coroutines + StateFlow (no LiveData, no RxJava)
 - **Local DB:** Android Room (offline-first — the app reads only from Room during operation)
 - **Cloud DB:** Supabase (PostgreSQL) — accessed via Supabase Kotlin SDK
-- **Auth:** Supabase Auth (anonymous user per device, created during pairing)
-- **Push:** Firebase Cloud Messaging (triggers sync, never carries data)
+- **Auth:** Supabase Auth (anonymous user per device, created during pairing). JWT carries `operator_id` as a custom claim, stamped by a server-side custom-access-token hook (see Setup Notes and architectural Rule 16).
+- **Push:** Firebase Cloud Messaging — data-only payload `{ type, operator_id, trigger }`. The push never carries content; it is a sync trigger only.
 - **GPS:** FusedLocationProviderClient in a foreground service
-- **Audio:** Android MediaPlayer for pre-rendered MP3 files (route-specific files synced from Supabase Storage; fixed announcement files bundled in APK). No on-device TTS is used.
-- **Kiosk:** Lock Task Mode (Level 2 — Device Owner) or screen pinning (Level 1)
-- **Background work:** WorkManager for periodic sync fallback
+- **Audio:** Android MediaPlayer for pre-rendered MP3 files. Route-specific files are downloaded from Supabase Storage at version-keyed paths (`route-audio/{operator_id}/{route_id}/{route_version}/...`) into `filesDir/audio/`. Fixed announcement files are bundled in the APK under `res/raw/`. **No on-device TTS is used.**
+- **Kiosk:** Screen pinning (Lock Task Mode Level 1) for the initial release. Lock Task Mode Level 2 (Device Owner mode) is deferred; the architecture is open to it without redesign but it is not in scope to build. See PRD §FR-AT-46.
+- **Background work:** WorkManager for periodic sync fallback and best-effort background heartbeat
+- **Heartbeat:** `HeartbeatController` driven by `ProcessLifecycleOwner` (lifecycle-based, not GPS-service-owned). See Rule 15.
+- **Crash telemetry:** Sentry (Android SDK). Initialised in `Application.onCreate`; uncaught exceptions and ANRs reported; PII stripped. See PRD §NFR-R-07.
 
 ---
 
@@ -76,26 +87,41 @@ The target structure is below. Create directories as needed; do not pre-create e
     │   ├── local/             # Room database, entities, DAOs, type converters
     │   ├── remote/            # Supabase client, Edge Function calls, FCM
     │   ├── repository/        # Repository implementations (single source of truth)
-    │   └── sync/              # SyncManager, SyncWorker, sync use cases
+    │   └── sync/              # SyncManager, SyncWorker, sync use cases, audio downloader
     ├── domain/                # Use cases, domain models, repository interfaces
     │   ├── model/             # Domain models (Route, Stop, JourneyState)
     │   ├── repository/        # Repository interfaces
     │   └── usecase/           # Use cases (StartJourney, AdvanceStop, etc.)
     ├── presentation/          # UI layer — Activities, Fragments, ViewModels
-    │   ├── pairing/           # First-run pairing flow
+    │   ├── pairing/           # First-run pairing flow (incl. GMS check, FR-AT-67)
     │   ├── routelist/         # Route list / selection
     │   ├── journey/           # Active journey screen (passenger view + tube-map)
     │   ├── driver/            # Driver control panel overlay
     │   ├── admin/             # Admin menu (PIN-protected)
+    │   ├── accountstatus/     # Account Status Screen (pending/suspended; FR-AT-60)
     │   └── common/            # Shared UI components and the custom TubeMapView
-    ├── service/               # Foreground GPS service, audio manager, kiosk controller
+    ├── service/               # Foreground GPS service, audio manager, kiosk controller, HeartbeatController
+    ├── telemetry/             # Sentry init + PII scrubbing
     ├── di/                    # Hilt modules
     └── util/                  # Extensions, constants, helpers
 
-    app/src/main/assets/
-    ├── naptan_stations.json.gz  # ~25–30MB compressed UK NaPTAN data
-    ├── alert_chime.mp3          # Regulatory alert tone (under 1 second)
-    └── silent_keepalive.mp3     # Bluetooth speaker keepalive (1 second, inaudible)
+    app/src/main/res/raw/      # Bundled fixed-announcement audio (see Data-Arch §6.3)
+    ├── alert_chime.mp3
+    ├── silent_keepalive.mp3
+    ├── termination.mp3
+    ├── hail_and_ride_start.mp3
+    ├── hail_and_ride_end.mp3
+    ├── diversion_start.mp3
+    └── diversion_end.mp3
+
+    # Runtime-resolved audio (not in the source tree — created in app's internal files dir):
+    # {context.filesDir}/audio/{operator_id}/{route_id}/{route_version}/
+    #     ├── route_announcement.mp3
+    #     ├── stop_0.mp3
+    #     ├── stop_1.mp3
+    #     └── ...
+    # route_version = routes.updated_at as epoch millis. Exactly one version per route at a
+    # time; older versions are removed on successful download of a new version.
 
     docs/                      # Frozen reference documents (DO NOT READ)
     ├── PRD.md
@@ -121,71 +147,117 @@ You can request builds with these commands. You cannot deploy to the physical ta
 
 ---
 
+## Setup Notes
+
+These setup steps are easy to miss and have non-obvious failure modes if forgotten.
+
+- **Custom access token hook (Supabase Auth console — manual step).** Server-side hook that stamps `operator_id` into the JWT custom claims for every issued token. This is a manual action in the Supabase Auth dashboard; it does NOT travel in migrations. Without it, every operator-scoped RLS policy quietly returns empty and the tablet appears to have no data. See Data-Architecture §12 setup checklist. If a paired tablet "is suddenly empty," check this first.
+- **Sentry DSN.** Configured via `gradle.properties` (or env var) and injected into the build at compile time. Do not commit the DSN to git.
+- **Firebase project linked.** `google-services.json` placed in `app/`. FCM data-only push depends on this.
+- **Google Play Services on the tablet.** The tablet must be a GMS-certified Android device. FR-AT-67 detects this at first run and surfaces a blocking warning if absent.
+
+---
+
 ## Architectural Rules — DO NOT VIOLATE
 
-These are the rules whose violation breaks the architecture. Treat them as inviolable.
+These are the rules whose violation breaks the architecture. Treat them as inviolable. Bracketed tags categorise each rule for quick scanning; rule numbers are stable references (e.g., "Rule 9").
 
-### 1. Presentation never touches Room directly
+### 1. [Architecture] Presentation never touches Room directly
 
 ViewModels call use cases. Use cases call repository interfaces. Repositories talk to Room and Supabase. No shortcuts.
 
 This is enforced by package boundaries — `presentation` does not import from `data.local` or `data.remote`. If a ViewModel needs data, the use case provides it.
 
-### 2. Room is the single read source during operation
+### 2. [Architecture] Room is the single read source during operation
 
 The UI never reads from Supabase. All data flows: Supabase → sync → Room → repository → use case → ViewModel → UI.
 
 The only direct Supabase access happens inside `data.remote` and `data.sync`. Repositories may write to Supabase as part of sync, but reads always come from Room.
 
-### 3. Supabase sync never blocks UI
+### 3. [Sync] Supabase sync never blocks UI
 
 Sync runs in a background coroutine. If sync fails, the app continues operating from cached Room data. No loading spinners waiting for network. The user sees the route list immediately from Room; sync happens silently in the background.
 
-### 4. Stops sync with their parent route, not independently
+### 4. [Sync] Stops sync as a unit with their parent route
 
-When uploading a route (future feature): UPSERT route, then delete-and-reinsert all stops for that route via the `replace_route_with_stops` RPC.
-
-When downloading: UPSERT route, then replace all local stops for that route.
+When downloading: UPSERT route, then replace all local stops for that route in a single transaction.
 
 `route_stops` has no `needs_upload`, `is_deleted`, or `updated_at` columns. Stops travel with their route. Never add per-stop sync metadata.
 
-### 5. Strict sequential stop progression
+**Scoped exception for `needs_upload`.** The no-`needs_upload` directive applies to `routes` and `route_stops` only. The one legitimate use of `needs_upload` in the initial release is the **`journey_summaries_pending` Room outbox** (Data-Arch §5.8) — a deliberate, narrow exception that supports the journey-summary upload at journey end (FR-AT-66). If you find yourself wanting `needs_upload` on any other Room table, stop and ask.
 
-GPS detection only monitors proximity to the NEXT expected stop in the route's stop_order sequence. Never scan all stops for the closest match. Never advance to a stop other than the next one.
+### 5. [Stop detection] Strict sequential progression with two-stop look-ahead
 
-This rule exists to prevent misfires when routes loop back, when stops are close together, or when GPS error briefly places the bus near a later stop. The stop_order sequence from route creation is the sole authority for progression order.
+GPS detection monitors only the **next expected stop (N)** and the **stop after it (N+1)**. Never scan all stops for the closest match. Never advance to a stop other than N or N+1.
 
-### 6. All timestamps in UTC
+Two-stop look-ahead behaviour: if a GPS fix triggers entry to N+1 before N has fired, auto-advance past N — log N as passed without detection, then fire the N+1 announcement. The `stop_order` sequence from route creation is the sole authority for progression order.
+
+This rule prevents misfires when routes loop back, when stops are close together, or when GPS error briefly places the bus near a later stop. See PRD §FR-AT-13.
+
+### 6. [Stop detection] Per-stop proximity radius and per-candidate GPS accuracy gating
+
+Detection radius is **per stop**, set on the dashboard route builder (default 200m). Read from `route_stops.proximity_radius_meters`; do not hard-code a global radius.
+
+Discard GPS fixes whose `horizontalAccuracyMeters` exceeds the **target stop's** configured radius. A bad fix is worse than no fix — better to wait for the next fix than to misfire on a 500m-accuracy reading against a 200m radius. See PRD §FR-AT-13 and dashboard §FR-WD-08.
+
+### 7. [Time] All timestamps in UTC
 
 Room stores epoch millis as LONG. Supabase stores TIMESTAMPTZ. Conversion to local UK time (GMT/BST) happens only at the UI layer for display.
 
 Never compare timestamps from Room to a `Date.getTime()` from a local-timezone source without explicit UTC conversion.
 
-### 7. Server assigns sync timestamps
+### 8. [Sync] Server assigns sync timestamps
 
 The `updated_at` column on routes is set by a PostgreSQL BEFORE trigger (`now()`), never by the client. The sync cursor (`last_server_timestamp`) is set from the server transaction's `current_timestamp`, not from the max `updated_at` in the batch.
 
+`routes.updated_at` (expressed as epoch millis) is also the `route_version` segment of the audio Storage path scheme — another reason it must originate server-side.
+
 If you find yourself setting `updated_at` from Kotlin code on an outgoing route, stop and ask. That's almost certainly wrong.
 
-### 8. Upload before download, abort if upload fails
+### 9. [Audio] Pre-rendered audio playback only — no on-device TTS
 
-Sync sequence: check account status → upload local changes → download remote changes. If upload fails, do not proceed to download — the download could overwrite un-synced local edits.
+Use Android `MediaPlayer` to play pre-rendered MP3 files. **Do not use the Android `TextToSpeech` API anywhere in this codebase.**
 
-In the current release, tablets have no local edits to upload (route authoring is dashboard-only), so the upload phase is effectively a no-op. The sequence is preserved for architectural correctness and future-proofing.
+Two sources of audio:
+- **Bundled fixed-announcement files** in APK `res/raw/`: `alert_chime.mp3`, `termination.mp3`, `hail_and_ride_start.mp3`, `hail_and_ride_end.mp3`, `diversion_start.mp3`, `diversion_end.mp3`, `silent_keepalive.mp3`. These are updated only by shipping a new APK.
+- **Route-specific files** synced from Supabase Storage at version-keyed paths to `{filesDir}/audio/{operator_id}/{route_id}/{route_version}/`: `route_announcement.mp3` and `stop_{N}.mp3` per stop (where `N` is the stop's `stop_order`). `route_version` is `routes.updated_at` in epoch millis. Exactly one version per route is held on the tablet at a time; older versions are deleted on successful download of a new version.
 
-### 9. Alert chime before certain announcements
+The chime-then-announcement sequence is atomic — the chime must finish before the announcement file begins, and the announcement file must always follow if the chime plays.
 
-The following announcements MUST be preceded by the bundled `alert_chime.mp3` (under 1 second):
+### 10. [Audio + Compliance] Alert chime + visual flash for the four regulated announcement types
+
+The following announcement types are subject to the combined-alert requirement:
 - Termination (Reg 8(2))
 - Diversion start (Reg 10(2)(b))
 - Hail-and-ride start (Reg 11(2)(b))
 - Hail-and-ride end (Reg 11(5)(b))
 
-This is a **legal requirement**, not a UX choice. Next-stop and route-and-destination announcements do NOT get an alert chime.
+Each MUST be:
+1. **Preceded by `alert_chime.mp3`** (bundled, under 1 second), AND
+2. **Accompanied by a 500ms high-contrast screen flash** (FR-AT-65) fired **simultaneously with the chime**, before the announcement overlay text appears.
 
-When implementing audio playback, ensure the chime-then-announcement sequence is atomic — the chime must finish before the announcement file begins, and the announcement file must always follow if the chime plays. Both the chime and all announcement audio are pre-rendered MP3 files; do not use the Android TextToSpeech API anywhere in this codebase.
+Both components are **co-equal** — neither alone satisfies the regulation. This is a **legal requirement**, not a UX choice.
 
-### 10. 22mm minimum text with calibration
+Next-stop and route-and-destination announcements get neither the chime nor the flash.
+
+### 11. [Audio gating] `audio_render_status` is the journey-start gate
+
+A journey cannot start unless **both** of the following hold for the selected route:
+1. The Room mirror of `routes.audio_render_status = 'ok'`. If it is `pending` or `failed`, the gate is closed regardless of file presence.
+2. All expected audio files exist in `{filesDir}/audio/{operator_id}/{route_id}/{route_version}/`. Expected files are derived from the route's stop count: one `route_announcement.mp3` plus one `stop_{N}.mp3` per stop.
+
+If either check fails, show an "Audio not ready — syncing" indicator and disable the Start Journey button. Trigger a sync. There is no fallback to on-device TTS. See PRD §FR-WD-20 and Data-Arch §6.4.
+
+### 12. [Audio gating] Tablets with `audio_enabled = false` skip audio downloads
+
+The `devices.audio_enabled` flag is a per-device boolean (dashboard-controlled, see dashboard CLAUDE.md Rule 11). When `audio_enabled = false`:
+- The sync skips the audio-download step entirely (no `route_announcement.mp3` or `stop_{N}.mp3` is fetched).
+- The audio manager suppresses all audio playback.
+- The visual journey UI is displayed in full — tube-map, overlays, flash alert, everything except audio.
+
+**Honest framing.** Software provides the per-device toggle and the dashboard surfaces a warning when more than one tablet in a fleet has audio enabled. **The system cannot enforce one-per-bus** — it does not know which physical bus a tablet is on. Enabling exactly one tablet per bus is operator responsibility.
+
+### 13. [UI] 22mm minimum text with calibration
 
 Passenger-facing text must be physically 22mm tall. Do not trust `DisplayMetrics` alone — many budget tablets report inaccurate DPI.
 
@@ -193,13 +265,33 @@ Use the stored `screen_calibration_ppmm` value from SharedPreferences (calculate
 
 This rule applies only to *passenger-facing* text — driver controls and admin screens are not regulated and can use normal text sizes.
 
-### 11. Tablet is read-only for routes
+### 14. [Sync] Tablet is read-only for routes
 
 Routes are authored exclusively on the web dashboard. The tablet displays routes, runs journeys, but does not create, edit, or delete routes.
 
 If you find yourself implementing a "Create Route" button or a NaPTAN search UI on the tablet, stop. That is dashboard-only functionality.
 
 The `routes` table in Room does NOT have a `needs_upload` column for this reason.
+
+### 15. [Heartbeat] Heartbeat is lifecycle-based, not GPS-service-owned
+
+Implementation: a `HeartbeatController` bound to `ProcessLifecycleOwner`. Two paths:
+- **App-foregrounded (reliable):** Any Activity in `RESUMED` state — route browsing, route detail, admin menu, active journey. Ticks every 2 minutes; updates `devices.last_seen_at`.
+- **Background/idle (best-effort):** `WorkManager` `PeriodicWorkRequest`. Not guaranteed on hostile-OEM hardware; documented acceptable gap.
+
+**The foreground GPS service is not the heartbeat owner.** The two have independent lifecycles and reliability profiles — don't co-locate heartbeat ticks inside the GPS service. Fleet managers should treat idle tablets as "not in service." See PRD §FR-AT-64.
+
+### 16. [Identity + Auth] JWT custom claims (`operator_id`) are the RLS contract
+
+After pairing, the Supabase JWT carries `operator_id` as a custom claim, stamped by the `custom_access_token_hook` registered in the Supabase Auth console (manual setup — see Setup Notes). RLS policies read `operator_id` from the JWT, never from query parameters.
+
+If the hook is misconfigured or unregistered, **every operator-scoped query silently returns empty**. This is the canonical failure mode to check first when "everything is suddenly empty."
+
+### 17. [Telemetry] Sentry crash reporting is required
+
+The Sentry SDK is initialised in `Application.onCreate`. Uncaught exceptions and ANRs are reported. PII is stripped (no operator_id, no device_id beyond a coarse install identifier, no location). Do not disable Sentry in release builds.
+
+See PRD §NFR-R-07.
 
 ---
 
@@ -211,11 +303,31 @@ The `routes` table in Room does NOT have a `needs_upload` column for this reason
 
 **`pending_deletion` flag on routes.** If a remotely deleted route is currently active in a journey, set `pending_deletion = true` instead of `is_deleted = true`. The route stays usable for the active journey but is hidden from the route list. Cleanup runs when the journey ends.
 
-**NaPTAN data is bundled.** Loaded from `assets/naptan_stations.json.gz` into Room on first launch and on APK update. Not synced from Supabase. The initial load takes 30–60 seconds; display a progress UI.
+**No NaPTAN on the tablet.** The tablet holds no NaPTAN database. Stop names, CRS codes, latitudes, and longitudes travel with routes via `route_stops` — copied at dashboard route-creation time. NaPTAN is dashboard-only. See CONTEXT Decision #23.
 
-**Route stops copy NaPTAN data at creation.** Stop name, CRS code, latitude, longitude are copied into `route_stops` rather than referenced by foreign key. This means routes survive NaPTAN database changes.
+**Route stops copy NaPTAN data at creation.** Stop name, CRS code, latitude, longitude are copied into `route_stops` rather than referenced by foreign key. This means routes survive NaPTAN database changes — and is now structurally necessary because the tablet has no NaPTAN to reference.
 
-**Operator and device identities come from SharedPreferences.** After pairing, `operator_id`, `device_id`, and `android_id` live in regular SharedPreferences. The Supabase JWT and refresh token live in EncryptedSharedPreferences.
+**Operator and device identities and credentials.** After pairing:
+- Regular `SharedPreferences` (non-secret): `operator_id`, `device_id`, `android_id`.
+- `EncryptedSharedPreferences` (secret): `device_secret` (issued at pairing, used for token recovery via `recover-device`), the Supabase JWT, and the refresh token.
+
+The JWT carries `operator_id` as a custom claim. See architectural Rule 16.
+
+**`devices.activation_state` enum** (renamed from `devices.status` in round-2 Task 3). Values per Data-Arch §2.2. The tablet reads this on pairing-check and recovery; an `inactive` device is blocked from journey start.
+
+**`operators.status` three-state enum** (`pending` / `active` / `suspended`). A `suspended` operator's tablets honour suspension **at journey end, not mid-journey** — an in-flight journey runs to its natural end, then on the next journey-start attempt the app transitions to the Account Status Screen (FR-AT-60). The `pending` and `suspended` states are never conflated; each has distinct UX.
+
+**`segment_type` on `route_stops`** and **`journey_skipped_stops` Room table.** `segment_type` (`scheduled` / `hail_and_ride`) drives H&R announcement and tube-map behaviour. `journey_skipped_stops` records stops the operator pre-marks as skipped on a journey instance (diversion handling). See CONTEXT Decision #16.
+
+**`journey_state` recovery rules.** On app restart, recover `journey_state` only if both: `last_event_at` is within the last 1 hour AND the journey is no older than 8 hours since start. Outside those bounds, discard the state. If recovery lands inside a diversion segment, **replay the diversion-start announcement** (full chime + flash + audio sequence).
+
+**`journey_events` lifecycle.** Cleared at **both** app startup and journey start (defensive double-cleanup; round-2 Task 3 fix).
+
+**`journey_summaries_pending` Room outbox.** Written at journey end with anonymous count metrics (no PII, no location). Uploaded to Supabase `journey_summaries` by a `WorkManager` job. This is the only Room table with a legitimate `needs_upload` column (see Rule 4 exception). See PRD §FR-AT-66 and Data-Arch §5.8.
+
+**Two route-level hashes.** Don't conflate them:
+- `routes.audio_announcement_hash` (Data-Arch §2.4) — SHA-256 of the route-announcement text. Drives the audio render worker's content-hash differential re-render (skip synthesis when unchanged).
+- `routes.stops_content_hash` (Data-Arch §2.4) — SHA-256 of the canonical stop-list serialisation. Drives the dashboard's structural FR-WD-12 divergence detection. Not used by the tablet directly; surface via sync only.
 
 ---
 
@@ -258,13 +370,13 @@ The user (architect) provides the commit message at the end of each task. Use th
 
 ## Known Gotchas
 
-These are concrete problems we hit in the previous build attempt. Avoid them.
+These are concrete problems we hit in the previous build attempt — plus a set of round-2 additions for the v3.8 architecture. Avoid them.
 
 ### Room schema mismatches require uninstall
 
 If you change a Room entity or DAO in a way that alters the schema (new column, changed type, renamed table), the app will crash on launch with `IllegalStateException: Room cannot verify the data integrity`. The user must uninstall the previous version (`adb uninstall com.pds.application`) and reinstall fresh.
 
-For changes during development, this is fine. For changes after deployment, a Room migration is required. Do not attempt to "fix" the integrity error by changing the expected hash — write a migration instead.
+For changes during development, this is fine. For changes after deployment, a Room migration is required. Do not attempt to "fix" the integrity error by changing the expected hash — write a migration instead. See WORKFLOW §10.3.
 
 ### Hilt + WorkManager requires getter form
 
@@ -306,9 +418,11 @@ If you find yourself adding a `getAllRoutes()` method, stop. Add `getRoutesForOp
 
 The foreground service must have a visible notification (FOREGROUND_SERVICE_TYPE_LOCATION). On Android 14+, this notification cannot be dismissed by the user during an active journey. Use a low-importance notification channel so it's quiet but persistent.
 
+The notification belongs to the GPS service alone. **Do not co-locate heartbeat ticks here** — heartbeat is owned by `HeartbeatController` / `ProcessLifecycleOwner` (Rule 15).
+
 ### EncryptedSharedPreferences key types
 
-EncryptedSharedPreferences only supports String, Int, Long, Float, Boolean, and Set<String>. To store a UUID, convert to String. To store a JWT (which is always String), just store as-is.
+EncryptedSharedPreferences only supports String, Int, Long, Float, Boolean, and Set<String>. To store a UUID, convert to String. To store a JWT or `device_secret` (both String), just store as-is.
 
 ### Coroutine scope in repositories
 
@@ -319,6 +433,38 @@ The single exception is the sync subsystem, which legitimately runs on its own s
 ### Time zones in display
 
 When showing a timestamp to the user (e.g., "last synced at 14:32"), convert from epoch millis (UTC) to local UK time at the UI layer using `java.time.ZonedDateTime`. Never use `SimpleDateFormat` without an explicit `TimeZone`. The UK switches between GMT and BST; `ZonedDateTime.now(ZoneId.of("Europe/London"))` handles this correctly.
+
+### Audio path mutation
+
+The `route_version` path component (`routes.updated_at` in epoch millis) changes on every successful re-render of the route's audio. Don't cache absolute audio paths in long-lived state — always resolve through the current `route_version` from the Room mirror of `routes`. A stale cached path will point at a directory that has been deleted as part of version cleanup.
+
+### Custom access token hook misconfiguration
+
+If RLS-scoped queries unexpectedly return empty for a paired tablet, the most likely cause is that the `custom_access_token_hook` is not registered in the Supabase Auth console. The hook is a **manual** dashboard step (not a migration); it is easy to forget after a project reset or environment switch. Check the hook before debugging RLS policies or Kotlin code.
+
+### GMS detection at first run (FR-AT-67)
+
+On first run (and on every subsequent launch as a cheap check), the app must detect Google Play Services availability via `GoogleApiAvailability.isGooglePlayServicesAvailable()`. If unavailable, surface a clear blocking warning. There is a "continue anyway" override (logged to `journey_events`) for development/testing on non-GMS hardware — production tablets must be GMS-certified. Don't crash; don't proceed silently.
+
+### Token recovery — transient vs terminal (FR-AT-04)
+
+The `recover-device` Edge Function distinguishes two failure classes:
+- **Transient** (network, 5xx, 429): retain cached credentials, retry with backoff. The tablet stays in service.
+- **Terminal** (404, 401, `activation_state = 'inactive'`, operator status not `active`): wipe local credentials and force re-pair.
+
+Surface different UI for each — a transient retry banner vs. a "this device has been deactivated, please re-pair" screen. Do not collapse them into a single "recovery failed" state.
+
+### FCM payload schema
+
+The push is **data-only**: `{ type, operator_id, trigger }`. It never carries content. Its sole purpose is to wake the tablet for a sync. Treat any other payload shape as a bug (server-side or client-side).
+
+### Rate-limit attempts
+
+`pair-device` and `recover-device` are rate-limited server-side via the `rate_limit_attempts` table (per-IP and per-Android-ID windows). Don't retry pairing in a tight loop — you'll lock the tablet out. Surface the rate-limit error to the user; the lockouts are short (10-minute and 15-minute windows) and intentional.
+
+### Journey state staleness recovery
+
+When recovering `journey_state` on app restart, enforce **both** age limits: max 1 hour since `last_event_at` AND max 8 hours since journey start. If recovery succeeds and the current segment is a diversion (`segment_type = 'hail_and_ride'` is NOT what to check here — diversion state is in `journey_state`, not `route_stops`), replay the diversion-start announcement in full (chime + flash + audio) so the passenger sees a coherent state.
 
 ---
 
@@ -342,6 +488,46 @@ Do not:
 This file is **not** a specification. It does not describe what the app does. The PRD describes that. This file describes **how to work on the app**.
 
 If you need to know "what does feature X do?", ask the user. If you need to know "how do I implement features in this codebase?", read this file.
+
+---
+
+## Sweep Summary (v3.8 changelog detail)
+
+Round-1 deltas (v3.0 → v3.7) now reflected:
+- Tablet NaPTAN bundle removed; no first-launch import. Stop data travels with routes.
+- Upload-sync rule (old "Rule 8") removed; sync is download-only.
+- Kiosk Level 2 (Device Owner) deferred; Level 1 screen pinning is initial release.
+- Operator-status three-state enum (`pending` / `active` / `suspended`) replaces `is_approved`.
+- Pre-rendered audio architecture documented; on-device TTS explicitly forbidden.
+- `device_secret` added to EncryptedSharedPreferences alongside JWT + refresh token.
+- JWT custom-claims contract (Rule 16) made explicit.
+- Per-stop `proximity_radius_meters` + GPS accuracy gate (Rule 6).
+- Two-stop look-ahead progression (Rule 5).
+- `segment_type` on `route_stops`; `journey_skipped_stops` Room table.
+- Version-keyed Storage paths; `filesDir/audio/{operator_id}/{route_id}/{route_version}/` layout.
+- Per-device `audio_enabled` flag with download skip (Rule 12).
+- `audio_render_status` journey-start gate (Rule 11).
+- FR-AT-65 visual flash made co-equal with the audio chime (Rule 10).
+
+Round-2 deltas (v3.7 → v3.8) now reflected:
+- Heartbeat moved to lifecycle ownership: `HeartbeatController` + `ProcessLifecycleOwner` (Rule 15). GPS service is no longer the heartbeat owner.
+- Audio pipeline: `pg_boss` job queue + Google Cloud TTS (voice `en-GB-Neural2-B`) + version-keyed paths + render-then-FCM ordering + differential re-render via `audio_announcement_hash`. The deprecated synchronous `render-route-audio` Edge Function is gone; replaced by `enqueue-render-job` (orchestrator) + `audio-render-worker` (queue consumer).
+- `audio_enabled` operator-responsibility framing made honest (Rule 12).
+- Operator suspension honoured at journey end, not mid-journey.
+- Sentry crash telemetry adopted on Android (initialised in `Application.onCreate`).
+- Journey summary upload at journey end via `journey_summaries_pending` outbox (FR-AT-66).
+- `audio_enabled = false` tablets skip audio downloads entirely (not just playback).
+- `stops_content_hash` for structural divergence detection (dashboard side; tablet syncs the column).
+- `journey_state` staleness recovery (8h/1h bounds); diversion announcement replay.
+- `journey_events` cleanup at both app startup and journey start.
+- FR-AT-67 GMS detection at first run.
+- FR-AT-04 transient vs terminal recovery classification.
+- `devices.status` renamed `devices.activation_state` (CHECK constraint).
+- 30-day heartbeat-billable / 60-day auto-deregister policy.
+- `rate_limit_attempts` table for `pair-device` / `recover-device`.
+- FCM data-only payload schema `{ type, operator_id, trigger }`.
+- Custom access token hook registration is a manual Supabase Auth console step.
+- Anonymous Supabase Auth user accumulation acknowledged as deferred operational concern.
 
 ---
 

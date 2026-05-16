@@ -1,7 +1,14 @@
 # CLAUDE.md
 # Passenger Display System (PDS) — Web Dashboard
 
+**Version:** 3.8 (May 2026)
+
 This file is your reference for working on the PDS web dashboard. Read it at the start of every session. It contains conventions, architectural rules, and known gotchas. If a rule here conflicts with a prompt, ask before deviating.
+
+## Changelog
+
+### v3.8 (May 2026)
+Previously unversioned. Brought into sync with the v3.8 planning suite via the round-2 close-out sweep. Reflects all round-1 (PRD/Data-Arch/Compliance v3.0 → v3.7) and round-2 (v3.7 → v3.8) decisions that had never propagated into CLAUDE.md. Substantive deltas — itemised in "Sweep summary" at the end of this file — include: operator-status three-state enum (`pending`/`active`/`suspended`) replacing boolean `is_approved`, with `/suspended` route added; audio pipeline replaced by `pg_boss` job queue + Google Cloud TTS + version-keyed Storage paths + render-then-FCM ordering (dashboard now calls `enqueue-render-job`, never the deprecated synchronous `render-route-audio` Edge Function); per-device `audio_enabled` toggle in fleet view with honest one-per-bus framing; FR-WD-12 divergence detection rewritten to structural `stops_content_hash` comparison; `devices.activation_state` rename; `routes.audio_render_status` + `routes.audio_version` + `routes.audio_announcement_hash` + `routes.stops_content_hash` columns; `journey_summaries` + `rate_limit_attempts` shared tables; `route-audio` Storage bucket; manual custom-access-token-hook setup step; Sentry crash telemetry; hard-delete language removed; anonymous Auth user accumulation acknowledged.
 
 ---
 
@@ -11,7 +18,7 @@ A Next.js web dashboard where UK bus operators register their company, manage th
 
 Bus operators sign up via this dashboard, get manually approved by the system administrator, then use the dashboard to create routes, generate device pairing codes, and monitor their fleet.
 
-The product is legally regulated under the UK Public Service Vehicles (Accessible Information) Regulations 2023. The dashboard contributes to compliance indirectly: the routes authored here are what tablets display to passengers, so accuracy matters.
+The product is legally regulated under the UK Public Service Vehicles (Accessible Information) Regulations 2023. The dashboard contributes to compliance indirectly: the routes authored here are what tablets display to passengers, so accuracy matters. The dashboard also kicks off the server-side audio render pipeline that produces the regulated pre-rendered announcements; render-then-FCM ordering is mandatory (see architectural Rule 10).
 
 ---
 
@@ -20,13 +27,14 @@ The product is legally regulated under the UK Public Service Vehicles (Accessibl
 - **Framework:** Next.js 15+ with App Router (not Pages Router)
 - **Language:** TypeScript (strict mode, no `any` without justification)
 - **Hosting:** Vercel (free tier)
-- **Backend:** Supabase (shared with the Android app — same project, same tables)
+- **Backend:** Supabase (shared with the Android app — same project, same tables). JWTs carry `operator_id` as a custom claim stamped by a server-side custom-access-token hook (manual Supabase Auth console setup — see "Setup Notes").
 - **Auth:** Supabase Auth (email + password)
 - **Data fetching:** Server Components and Server Actions; minimal client-side Supabase SDK use for interactive bits
 - **Styling:** Tailwind CSS
 - **Components:** shadcn/ui (Radix UI primitives + Tailwind)
 - **Forms:** React Hook Form + Zod for validation
 - **Icons:** Lucide React (bundled with shadcn/ui)
+- **Crash telemetry:** Sentry (Next.js SDK; both server and edge runtimes). See PRD §NFR-R-07.
 
 ---
 
@@ -75,9 +83,10 @@ The target structure is below. Create directories as needed; do not pre-create e
     │   │   └── layout.tsx            # Auth layout (centred form, no nav)
     │   ├── (dashboard)/              # Routes with dashboard layout (logged-in users)
     │   │   ├── routes/               # Route list, route detail, route create/edit
-    │   │   ├── devices/              # Device fleet view, pairing
+    │   │   ├── devices/              # Device fleet view, pairing, audio_enabled toggle
     │   │   ├── account/              # Account settings
-    │   │   ├── pending/              # "Pending approval" landing
+    │   │   ├── pending/              # "Pending approval" landing (status = 'pending')
+    │   │   ├── suspended/            # "Account suspended" landing (status = 'suspended')
     │   │   └── layout.tsx            # Dashboard layout (nav, header)
     │   ├── api/                      # Route handlers if needed (rare — prefer server actions)
     │   ├── layout.tsx                # Root layout
@@ -91,11 +100,14 @@ The target structure is below. Create directories as needed; do not pre-create e
     │   ├── supabase/                 # Supabase client setup (server, client, middleware variants)
     │   ├── actions/                  # Server actions, organised by domain
     │   │   ├── routes.ts             # createRoute, updateRoute, deleteRoute
-    │   │   ├── devices.ts            # generatePairingCode, deactivateDevice, renameDevice
+    │   │   ├── devices.ts            # generatePairingCode, deactivateDevice, renameDevice, setAudioEnabled
     │   │   └── account.ts            # updateProfile, changePassword
     │   ├── schemas/                  # Zod schemas for validation
     │   ├── types/                    # Shared TypeScript types (often generated from Supabase)
     │   └── utils/                    # Generic utilities (formatDate, cn, etc.)
+    ├── sentry.client.config.ts       # Sentry browser init
+    ├── sentry.server.config.ts       # Sentry server runtime init
+    ├── sentry.edge.config.ts         # Sentry edge runtime init
     └── middleware.ts                 # Auth middleware (refresh session on every request)
 
     docs/                             # Frozen reference documents (DO NOT READ)
@@ -124,19 +136,30 @@ Deployment to Vercel happens automatically on push to `main`. The user manages V
 
 ---
 
+## Setup Notes
+
+Manual setup steps that are easy to miss and have non-obvious failure modes if forgotten.
+
+- **Custom access token hook (Supabase Auth console — manual step).** Server-side hook that stamps `operator_id` into the JWT custom claims for every issued token. This is a manual action in the Supabase Auth dashboard; it does NOT travel in migrations. Without it, **every operator-scoped RLS policy quietly returns empty** for both dashboard and tablet sessions. See Data-Architecture §12 setup checklist. After any project reset, re-register before debugging anything else.
+- **Sentry DSN.** Configured via Vercel environment variable; do not commit the DSN to git.
+- **pg_boss schema.** The audio pipeline runs on `pg_boss` (Postgres-backed job queue). `pg_boss` owns its own schema in the Supabase database — see Data-Arch §11. Migrations are managed by `pg_boss` itself, not by the dashboard repo.
+- **`audio-render-worker` deployment.** The worker is a separate runtime that polls the `pg_boss` queue. It is not a Supabase Edge Function and is deployed independently. The dashboard does not own its deployment — it only enqueues jobs.
+
+---
+
 ## Architectural Rules — DO NOT VIOLATE
 
-These are the rules whose violation breaks the architecture. Treat them as inviolable.
+These are the rules whose violation breaks the architecture. Treat them as inviolable. Bracketed tags categorise each rule for quick scanning; rule numbers are stable references (e.g., "Rule 9").
 
-### 1. Server Components by default, client components only when needed
+### 1. [Next.js] Server Components by default, client components only when needed
 
 Next.js App Router is Server Component-first. Every component you write defaults to running on the server. Only add `"use client"` when you genuinely need client-side interactivity (forms with complex state, drag-and-drop, charts, anything using browser APIs).
 
 If you find yourself adding `"use client"` to the top of every file, stop and reconsider. Most of the dashboard is data display, which is a server-component case.
 
-### 2. Mutations are Server Actions, not API routes
+### 2. [Next.js] Mutations are Server Actions, not API routes
 
-For any operation that changes data (create/update/delete route, generate pairing code, etc.), use a Server Action. Do not create a `/app/api/` route handler unless you have a specific reason (e.g., a third-party webhook).
+For any operation that changes data (create/update/delete route, generate pairing code, toggle `audio_enabled`, etc.), use a Server Action. Do not create a `/app/api/` route handler unless you have a specific reason (e.g., a third-party webhook).
 
 Server Actions live in `src/lib/actions/`. They are exported async functions marked with `"use server"`. They are called directly from server components (via form actions) or from client components (via `useTransition` or form actions).
 
@@ -152,79 +175,106 @@ Example structure:
     export async function createRoute(formData: FormData) {
       const supabase = await createServerSupabaseClient();
       const parsed = RouteSchema.parse(Object.fromEntries(formData));
-      // ... insert into Supabase
+      // ... insert into Supabase via the replace_route_with_stops RPC (Rule 9)
       revalidatePath("/routes");
     }
 
-### 3. Auth checks at the layout level, not per-component
+### 3. [Auth] Auth checks at the layout level, not per-component
 
 Every protected route is under `(dashboard)/layout.tsx`. That layout fetches the user once via `getUser()` and either renders children or redirects. Individual pages do not re-check auth.
 
 The middleware (`src/middleware.ts`) refreshes the Supabase session on every request to keep tokens fresh. The layout does the actual gating.
 
-### 4. The `is_approved` gate is enforced server-side
+### 4. [Auth + Gate] The operator-status gate is a three-state enum, server-enforced
 
-After auth, every dashboard action must check that the operator's `is_approved = true`. This is enforced by RLS at the database level (queries return empty for unapproved operators), and additionally by the dashboard's routing logic:
+After auth, every dashboard action must check the operator's `status` column. Values: `pending`, `active`, `suspended`. **Distinct UX per state** (PRD §FR-WD-04, §FR-WD-05; CONTEXT Decision #18):
 
-- The `(dashboard)/layout.tsx` checks `is_approved` after auth.
-- If false, the user is redirected to `/pending`.
-- The `/pending` route shows the "account pending approval" message.
-- Account profile pages remain accessible even when pending; everything else is gated.
+- **`pending`** → redirect to `/pending`. Show the "account pending approval" page. Account-profile pages remain accessible so the operator can update contact details; everything else is gated.
+- **`active`** → normal dashboard access.
+- **`suspended`** → redirect to `/suspended`. Show the "account suspended — contact support" page. **Read-only** access to historical data; no route edits, no device pairing, no fleet mutations. On the tablet side, in-flight journeys continue to natural end — operator-suspension is honoured at journey end, not mid-journey (see Android CLAUDE.md Rule 15-equivalent decisions).
 
-Do not implement "soft" approval gates in individual components. The single chokepoint is the dashboard layout.
+Enforcement is layered: **RLS at the database** (mutation queries silently return empty for non-`active` operators) AND the dashboard's `(dashboard)/layout.tsx` performs the redirect. Do not rely on either layer alone. Do not implement "soft" approval gates in individual components — the single chokepoint is the dashboard layout (plus RLS).
 
-### 5. Supabase queries respect RLS — do not bypass it
+The old `is_approved BOOLEAN` is gone. Anywhere you find code referencing it, it is wrong.
 
-The dashboard always uses the user-scoped Supabase client (with the user's session JWT). Never use the service role key from the client or from regular server actions. RLS policies are the authoritative security boundary.
+### 5. [Auth] Supabase queries respect RLS — do not bypass it
 
-The service role key is used only by Edge Functions (which run in Supabase's environment, not in Next.js). If a dashboard operation seems to require service role privileges, that operation belongs in an Edge Function, not in a Server Action.
+The dashboard always uses the user-scoped Supabase client (with the user's session JWT, which carries `operator_id` via the custom-access-token hook). Never use the service role key from the client or from regular server actions. RLS policies are the authoritative security boundary.
+
+The service role key is used only by Edge Functions and by the `audio-render-worker` (both of which run outside Next.js). If a dashboard operation seems to require service role privileges, that operation belongs in an Edge Function, not in a Server Action.
 
 Examples requiring Edge Functions, not Server Actions:
 - Generating pairing codes (writes to `device_pairing_codes` are service-role-only)
 - Creating anonymous Supabase users (admin API)
 - Modifying device JWTs
+- Enqueuing audio render jobs (`enqueue-render-job` — Rule 10)
 
 The dashboard calls Edge Functions via `supabase.functions.invoke()`.
 
-### 6. Routes are authored on the dashboard, not the tablet
+### 6. [Routes] Routes are authored on the dashboard, not the tablet
 
 The tablet is read-only for routes. The dashboard is the **only** authoring surface. All CRUD on routes happens here.
 
-This means the dashboard's route builder is the most feature-rich UI in the product. It must handle: NaPTAN search, drag-and-drop stop reordering, return route generation, route metadata, validation, error states. Build this carefully.
+This means the dashboard's route builder is the most feature-rich UI in the product. It must handle: NaPTAN search, drag-and-drop stop reordering, return route generation, per-stop `proximity_radius_meters` configuration, per-stop `segment_type` (`scheduled` vs `hail_and_ride`), route metadata, validation, error states. Build this carefully.
 
-### 7. NaPTAN data is queried, not bundled
+### 7. [NaPTAN] NaPTAN data is queried, not bundled
 
 The dashboard queries NaPTAN data from the Supabase `naptan_stations` table via Postgres full-text search. Do not download the entire NaPTAN dataset to the client. The table has ~400,000 rows; only return what matches the user's search query.
 
 Search is debounced (250ms typical). Results limited to ~20 hits per query.
 
-### 8. Stop data is copied into route_stops at creation
+### 8. [Routes] Stop data is copied into `route_stops` at creation
 
 When the user adds a stop to a route, the NaPTAN ID, name, CRS code, latitude, and longitude are *copied* into the new `route_stops` row. The `route_stops` table does not foreign-key to `naptan_stations`. This means routes survive NaPTAN data changes (a station rename in NaPTAN does not affect saved routes).
 
-This is the same rule as the Android side (rule 4 there). The behaviour must be consistent across both surfaces.
+This is the same rule as the Android side. The behaviour must be consistent across both surfaces — and is structurally necessary, since the tablet holds no NaPTAN database to reference.
 
-### 9. Use the atomic route + stops RPC for saves
+### 9. [Routes] Use the atomic route + stops RPC for saves
 
-When saving a route (create or update), call the `replace_route_with_stops` Supabase RPC. This is a single transactional operation that upserts the route and replaces all its stops atomically.
+When saving a route (create or update), call the `replace_route_with_stops` Supabase RPC. This is a single transactional operation that upserts the route, replaces all its stops, **and computes `routes.stops_content_hash`** from the just-inserted stops (canonical form per Data-Arch §4.4).
 
 Do not:
-- Insert the route and then insert stops in separate queries (race condition)
-- Delete stops before inserting new ones in separate queries (deletes orphan stops if insert fails)
+- Insert the route and then insert stops in separate queries (race condition).
+- Delete stops before inserting new ones in separate queries (orphans stops if insert fails).
+- Compute `stops_content_hash` client-side. The hash is the integrity contract for FR-WD-12 divergence detection; it must be authoritative and is computed by the RPC.
 
-Always use the RPC.
+After the RPC succeeds, the Server Action enqueues an audio render job via the `enqueue-render-job` Edge Function (Rule 10). The save endpoint does not wait for render completion — it returns immediately and the UI shows "Audio rendering" until `routes.audio_render_status = 'ok'`.
 
-### 10. All timestamps in UTC
+### 10. [Audio] Audio rendering happens via `pg_boss`, not by the dashboard
+
+The dashboard **enqueues** an audio render job and returns. A separate worker — `audio-render-worker` — consumes the `render-route-audio` job from the `pg_boss` queue, calls **Google Cloud TTS** (voice `en-GB-Neural2-B`, locked) for each line, writes versioned MP3 files to the `route-audio` Storage bucket at `{operator_id}/{route_id}/{route_version}/...`, and on success bumps `routes.audio_version`-equivalent state (`audio_render_status = 'ok'`, `audio_announcement_hash` updated).
+
+**Render-then-FCM is mandatory.** The worker — not a DB trigger, not the dashboard — dispatches the FCM data-only push that triggers the tablet to sync, AFTER the audio files are in Storage. Tablets must not be told to sync before the new audio is available, or they will 404 trying to download it.
+
+**Differential re-render.** If `audio_announcement_hash` is unchanged for the route-announcement text, the worker skips synthesis for that file and copies the file from the previous `route_version` directory to the new one. Same for per-stop files keyed on the stop name (Data-Arch §4.6).
+
+**The deprecated synchronous `render-route-audio` Edge Function is gone.** Do not call it; it does not exist. The name `render-route-audio` survives only as the `pg_boss` **job name** queued by `enqueue-render-job`.
+
+### 11. [Audio] `audio_enabled` toggle in the fleet view
+
+The fleet view exposes a per-device `audio_enabled` boolean toggle (Server Action: `setAudioEnabled`). Defaults: the first tablet paired to an operator → `true`; subsequent tablets → `false`.
+
+**Honest framing.** This is a **per-device** control. The operator's responsibility is to enable audio on exactly one tablet per bus. The dashboard surfaces a **non-blocking warning** when more than one tablet in an operator's fleet has `audio_enabled = true` (e.g., "3 tablets have audio enabled — ensure only one per bus"). The dashboard does **not** enforce the one-per-bus constraint because the system cannot tell which physical bus a tablet is on. See PRD §FR-WD-19, §5.2.
+
+Tablets with `audio_enabled = false` skip audio downloads entirely (not just playback) — see Android CLAUDE.md Rule 12. Toggling a tablet from `false` to `true` will trigger an audio download on the tablet's next sync.
+
+### 12. [Routes] FR-WD-12 divergence detection is structural (content hash)
+
+When editing a route whose `linked_return_route_id` is set, compare the source route's `stops_content_hash` to the linked return route's `stops_content_hash_at_generation`. If they differ, surface a divergence warning with options `[Re-generate return]` / `[Keep existing]`.
+
+**Do not use timestamps.** The old `last_synced_with_return TIMESTAMPTZ` mechanism is deprecated — it fired on every edit (warning fatigue). The structural hash comparison fires only when the stop list actually changes. `last_synced_with_return` is retained as a soft audit signal but is no longer the divergence trigger. See PRD §FR-WD-12 and Data-Arch §2.4.
+
+### 13. [Time] All timestamps in UTC
 
 Supabase stores `TIMESTAMPTZ` in UTC. When displaying timestamps to the user, convert to UK local time (handles GMT/BST) using `Intl.DateTimeFormat` with `timeZone: 'Europe/London'`. Never use raw `Date` formatting that depends on the server's locale.
 
-### 11. Forms validated with Zod
+### 14. [Forms] Forms validated with Zod
 
 Every form has a Zod schema in `src/lib/schemas/`. Server Actions parse `FormData` through that schema before touching Supabase. Client-side validation (via React Hook Form's Zod resolver) provides immediate feedback; server-side validation is the authoritative check.
 
 Schemas are shared between client and server. Do not duplicate validation logic.
 
-### 12. TypeScript strict mode
+### 15. [TypeScript] TypeScript strict mode
 
 The project is in TypeScript strict mode. `any` is banned without a written justification comment. Supabase types are generated from the schema using `supabase gen types` — use the generated types, do not write your own.
 
@@ -238,13 +288,30 @@ When the generated types are stale (e.g., a migration added a column), regenerat
 
 **Email/password auth for operators.** No magic links, no social login, no MFA in the initial release. Supabase Auth handles the flow (signup, email verification, password reset). Use the default Supabase Auth UI flows or build matching screens.
 
-**Anonymous users for devices.** Tablets pair via Edge Functions that create anonymous Supabase Auth users. The dashboard never creates these users; it only triggers the flow by generating pairing codes. Devices are linked to operators via the `devices` table's `operator_id` and `user_id` columns.
+**Anonymous users for devices.** Tablets pair via Edge Functions that create anonymous Supabase Auth users. The dashboard never creates these users; it only triggers the flow by generating pairing codes. Devices are linked to operators via the `devices` table's `operator_id` and `user_id` columns. **Note:** anonymous users accumulate over time (no automatic cleanup in the initial release) — see Known Gotchas.
 
 **Operator → user mapping is one-to-one.** Each operator has exactly one Supabase Auth user. No team accounts. If multiple people at a bus company need access, they share the login.
 
-**Soft deletes for routes.** Deleting a route sets `is_deleted = true`, not a hard `DELETE`. This is required for the tablets' sync algorithm — deleted routes propagate as tombstones. Always use the dashboard's delete action; never issue a hard DELETE.
+**Operator status is a three-state enum, not a boolean.** `operators.status TEXT CHECK IN ('pending', 'active', 'suspended')`. Replaces the old `is_approved BOOLEAN`. See Rule 4.
+
+**Device activation state is a separate enum.** `devices.activation_state TEXT` (renamed from `devices.status` in round-2 Task 3 to disambiguate from `operators.status`). Values per Data-Arch §2.2. The `pair-device` and `recover-device` Edge Functions read this.
+
+**Per-device `audio_enabled` boolean** in `devices`. Defaults: first tablet paired to operator → `true`; subsequent → `false`. See Rule 11.
+
+**Route-level audio columns** on `routes`:
+- `audio_version` (epoch millis; equals `updated_at`) — used as the Storage path segment.
+- `audio_render_status` enum (`pending` / `ok` / `failed`) — surfaced in the route list; used as the tablet's journey-start gate.
+- `audio_render_error` — set when `audio_render_status = 'failed'`; surfaced for diagnostics.
+- `audio_announcement_hash` — SHA-256 of the route-announcement text; drives differential re-render.
+- `stops_content_hash` — SHA-256 of the canonical stop-list serialisation; drives FR-WD-12 (Rule 12).
+
+**Soft handling of route deletion.** Deleting a route sets `is_deleted = true`, not a hard `DELETE`. Tombstone propagates to tablets via sync. **Routes are not hard-deleted on a fixed schedule in the initial release** — the old 90-day hard-delete reference was removed in round-2 Task 3. If a hard-delete is ever introduced later, `devices.active_route_id` is already `ON DELETE SET NULL` to prevent cascade-blocks.
 
 **NaPTAN search via Postgres full-text.** The `naptan_stations.search_vector` column is a generated `TSVECTOR`. Queries use `search_vector @@ websearch_to_tsquery('english', :query)`. Results ranked by `ts_rank`. Return the top 20.
+
+**`journey_summaries` table** (Supabase). Anonymous count metrics uploaded by tablets at journey end. RLS scoped by `operator_id`. The dashboard surfaces a paginated list per fleet for diagnostics. See PRD §FR-AT-66.
+
+**`rate_limit_attempts` table.** Server-side rate-limit storage for `pair-device` (per-IP) and `recover-device` (per-Android-ID). 24-hour retention via the daily 03:00 UTC cleanup. Service-role only — the dashboard does not read or write it. See Data-Arch §2.9.
 
 ---
 
@@ -287,7 +354,7 @@ The user provides the commit message at the end of each task. Use the format:
 
 ## Known Gotchas
 
-These are concrete problems that often bite Next.js + Supabase dashboards. Avoid them.
+These are concrete problems that often bite Next.js + Supabase dashboards, plus round-2 additions for the v3.8 architecture.
 
 ### Server vs client Supabase clients are different
 
@@ -333,6 +400,18 @@ If RLS rejects a query, Supabase returns an empty result set, not an error. This
 
 If an authenticated user "can't see" data they should see, check the RLS policy first.
 
+### Custom access token hook is a manual Supabase Auth console step
+
+The hook that stamps `operator_id` into the JWT custom claims is **not** a database migration — it is a manual action in the Supabase Auth dashboard (see Setup Notes). After a project reset, environment switch, or fresh setup, RLS-scoped queries will return empty until the hook is re-registered. **Check this first** before debugging RLS policies or client code when "nothing shows up."
+
+### `stops_content_hash` is server-computed
+
+The hash is computed inside the `replace_route_with_stops` RPC, never by the dashboard. Don't compute it client-side and pass it in — the hash is the integrity contract for FR-WD-12 divergence detection (Rule 12). Trust the RPC.
+
+### Anonymous Supabase Auth users accumulate
+
+Each successful tablet pairing creates an anonymous Supabase Auth user. There is **no automatic cleanup** in the initial release — deregistering or replacing a tablet leaves the auth user behind. Deferred operational concern; flagged for future hardening. Don't panic when `auth.users` grows beyond the dashboard-user count.
+
 ### Generated types vs hand-written types
 
 Supabase types are in `src/lib/types/database.ts`. They are regenerated from the schema; do not hand-edit them. If you need a derived type (e.g., "RouteWithStops"), define it in a separate file:
@@ -359,6 +438,10 @@ Every push to a branch deploys a preview URL. Do not include secrets in PR descr
 
 Production environment variables are set in Vercel's dashboard, not in the repo. The user manages this.
 
+### Render-then-FCM ordering must not be bypassed
+
+If a future task tempts you to "just fire FCM directly from the dashboard so the tablets refresh faster" — don't. The tablets will 404 trying to download audio that hasn't been rendered yet. The `audio-render-worker` is the only component that dispatches the post-save FCM push, and only after render success. See Rule 10.
+
 ---
 
 ## What to Do When Stuck
@@ -380,10 +463,12 @@ Do not:
 
 The dashboard and the Android app are in separate repositories but share:
 
-- The Supabase project and schema
-- The `routes`, `route_stops`, `devices`, `operators`, `naptan_stations`, and `device_pairing_codes` tables
-- The Edge Functions (`generate-pairing-code`, `pair-device`, `recover-device`, plus RPCs)
-- The auth model (Supabase Auth users for both operators and devices)
+- **The Supabase project and schema**, including RLS policies and the `custom_access_token_hook`.
+- **Tables:** `operators`, `devices`, `routes`, `route_stops`, `naptan_stations`, `device_pairing_codes`, `journey_summaries`, `rate_limit_attempts`.
+- **Edge Functions** called from the dashboard: `generate-pairing-code`, `pair-device`, `recover-device`, `enqueue-render-job`. The dashboard does NOT call `render-route-audio` — that name is now the `pg_boss` job name, not an Edge Function; the dashboard interacts with it only by enqueuing via `enqueue-render-job`.
+- **Worker:** `audio-render-worker` consumes the `render-route-audio` `pg_boss` job, calls Google Cloud TTS, writes to the `route-audio` Storage bucket, and dispatches the post-render FCM push. Not directly invoked by the dashboard; deployed independently.
+- **Storage bucket:** `route-audio` (object scheme: `{operator_id}/{route_id}/{route_version}/...`). Written by the worker; read by tablets.
+- **Auth model:** Supabase Auth users for both operators (regular email/password) and devices (anonymous, created by `pair-device`). The custom access token hook stamps `operator_id` into the JWT custom claims for both — RLS depends on this.
 
 If a feature in the dashboard implies a schema change, that change affects the Android app too. The architect coordinates schema changes deliberately — never modify the database schema as a side effect of a dashboard task.
 
@@ -394,6 +479,32 @@ If a feature in the dashboard implies a schema change, that change affects the A
 This file is **not** a specification. It does not describe what the dashboard does. The PRD describes that. This file describes **how to work on the dashboard**.
 
 If you need to know "what does feature X do?", ask the user. If you need to know "how do I implement features in this codebase?", read this file.
+
+---
+
+## Sweep Summary (v3.8 changelog detail)
+
+Round-1 deltas (v3.0 → v3.7) now reflected:
+- Operator-status three-state enum (`pending` / `active` / `suspended`) replaces boolean `is_approved`; `/suspended` route added (Rule 4).
+- Per-device `audio_enabled` boolean with dashboard fleet-view toggle (Rule 11).
+- `routes.audio_render_status` / `audio_version` / `audio_announcement_hash` columns and the journey-start-gate semantics on the tablet side (Rule 10).
+- `route-audio` Storage bucket added to coordination list.
+- FR-WD-12 return-route divergence detection introduced (then re-engineered in round 2 — see below).
+- Per-stop `proximity_radius_meters` and per-stop `segment_type` documented in Rule 6 surface.
+
+Round-2 deltas (v3.7 → v3.8) now reflected:
+- Audio pipeline rebuilt: dashboard calls `enqueue-render-job` (Edge Function), `audio-render-worker` consumes the `render-route-audio` `pg_boss` job, Google Cloud TTS (voice `en-GB-Neural2-B` locked), version-keyed Storage paths, render-then-FCM ordering (Rule 10). The deprecated synchronous `render-route-audio` Edge Function is removed.
+- `routes.stops_content_hash` computed inside `replace_route_with_stops`; drives structural FR-WD-12 divergence detection (Rule 12). The old `last_synced_with_return` timestamp mechanism is deprecated.
+- `audio_enabled` framing made honest — per-device toggle + non-blocking warning, no system enforcement of one-per-bus (Rule 11).
+- Operator suspension is honoured at journey end on the tablet (Rule 4 narrative).
+- Sentry crash telemetry adopted on the dashboard (server, client, and edge runtimes).
+- `journey_summaries` table added to shared backend list.
+- `audio_enabled = false` tablets skip audio downloads entirely (clarified Rule 11).
+- `devices.status` renamed `devices.activation_state` (CHECK constraint).
+- `rate_limit_attempts` table added to shared backend list.
+- Hard-delete language removed (no scheduled hard-deletes in initial release; `ON DELETE SET NULL` retained as defence).
+- Custom access token hook documented as a manual Supabase Auth console setup step (Setup Notes + Known Gotchas).
+- Anonymous Auth user accumulation acknowledged as deferred operational concern.
 
 ---
 
