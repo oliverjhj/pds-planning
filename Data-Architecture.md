@@ -7,6 +7,26 @@
 
 ## Changelog
 
+### v3.8 (May 2026 — item 3 of 4)
+Round-2 post-adversarial-review re-planning pass, item 3 of 4 (missing-detail fixes and small bugs).
+- §2.2: Renamed `devices.status` → `devices.activation_state` with an explicit CHECK constraint, disambiguating from `operators.status`. Updated `active_route_id` description to drop the 90-day hard-delete reference (no scheduled hard-deletes in the initial release — see §10).
+- §2.4: Added `stops_content_hash TEXT NULLABLE` column to `routes` — SHA-256 of the canonical stop-list serialisation. Drives FR-WD-12 structural divergence detection (replaces the old `updated_at > last_synced_with_return` comparison, which fired on every save). `last_synced_with_return` is retained as a soft audit signal but is no longer the divergence trigger.
+- §2.6: Dropped 90-day hard-delete reference from `journey_summaries.route_id` description.
+- §2.8: Storage "Deleted" lifecycle bullet rephrased — hard-deletion is a manual administrative action, not part of automated retention.
+- §2.9 (new): `rate_limit_attempts` table — concrete schema for the rate-limit storage substrate previously referenced as "(or Edge Function KV store)" in §4.2 and §4.3. Service-role only; 24-hour retention via the existing 03:00 UTC daily cleanup.
+- §3.2: Added "Anonymous auth-user accumulation" acknowledgement — every pair-device creates a new `auth.users` row that survives deactivation. MVP-acceptable, future cleanup task acknowledged out-of-scope.
+- §4.2 `pair-device`: Rewrote step 6/6a around the `audio_enabled` count bug. Count of existing devices is now queried *before* the INSERT, then `audio_enabled = (existing_count = 0)` is set directly in the INSERT — no post-insert UPDATE. Added an integration-test requirement that pairs the first device and asserts `audio_enabled = true`. Rate-limit subsection updated to reference §2.9 explicitly (dropped the KV-store hedge).
+- §4.3 `recover-device`: `devices.status = 'inactive'` → `devices.activation_state = 'inactive'`. Added a "Failure classification" subsection consumed by PRD FR-AT-04 (transient vs terminal). Rate-limit subsection updated to reference §2.9 explicitly.
+- §4.4 `replace_route_with_stops`: Added step 4 — compute `stops_content_hash` from the just-inserted stops and write it to `routes`. Specifies the canonical hash form and why `updated_at` and `stops_content_hash` diverge for non-structural edits.
+- §4.7 Storage cleanup: Added a soft-deleted-routes paragraph and rephrased the hard-delete cross-reference as a manual administrative action rather than a scheduled retention pass.
+- §5.4 `journey_events`: Added `JOURNEY_AUTO_CLEARED`, `DIVERSION_REPLAYED`, `GMS_OVERRIDE_ACKNOWLEDGED` event types with their respective `detail` values.
+- §5.5 `journey_state`: Added recovery staleness rules and the constants `JOURNEY_STATE_MAX_AGE_HOURS = 8` and `JOURNEY_EVENT_RECENCY_THRESHOLD_HOURS = 1`. Stale state is auto-cleared on launch rather than resumed; diversion replay on non-empty `journey_skipped_stops` is folded into the resume path.
+- §7.2 sync algorithm: Added the `audio_enabled` guard at the top of the audio-download step — display-only tablets (`audio_enabled = false`) skip audio download entirely. Step 8 also detects `audio_enabled` flips `false → true` and resets the sync cursor so the next sync back-fills audio.
+- §7.4 full sync sequence: Cross-references the §7.2 `audio_enabled` guard.
+- §7.6 FCM: Concrete payload schema specified — data-only Android messages with `type`, `operator_id`, `trigger` keys. Dispatch filter updated to `activation_state = 'active'` AND `fcm_token IS NOT NULL`.
+- §10 retention table: Removed the "could be hard-deleted after 90 days" language. Replaced "Inactive devices" row with "Active vs auto-deregistered devices" pinned to **30-day heartbeat-billable / 60-day auto-deregister**, reconciling PRD §1.4 (billing window) and the previously-uncoordinated deregistration policy. Added a row acknowledging anonymous-auth-user accumulation. Added a staleness-recovery cross-reference to the journey-state row.
+- §12 setup checklist: Added a new step 4 for registering the custom access token hook in Supabase Auth — a manual console action that does not travel in migrations and whose absence causes silent RLS failures. Added `rate_limit_attempts` cleanup and 60-day auto-deregistration to the existing 03:00 UTC scheduled function.
+
 ### v3.8 (May 2026 — item 2 of 4)
 Round-2 post-adversarial-review re-planning pass, item 2 of 4 (bug fixes and operational hardening: heartbeat lifecycle redesign, mid-journey suspension grace, journey-summary upload, Sentry telemetry).
 - §2.6 (new): `journey_summaries` Supabase table — per-journey count metrics (no PII, no location traces). RLS scoped by `operator_id`.
@@ -168,14 +188,14 @@ One row per registered tablet. Devices are linked to anonymous Supabase Auth use
 | android_id | TEXT | NOT NULL | Settings.Secure.ANDROID_ID from the tablet. Passed to `recover-device` as the device row lookup key (non-secret identifier). Authentication of the recovery request relies on `device_secret_hash`, not the Android ID alone. |
 | device_secret_hash | TEXT | NOT NULL | SHA-256 hash (hex-encoded) of the 256-bit device secret generated at pairing time by `pair-device`. The plaintext secret is returned to the tablet once in the pairing response and stored in EncryptedSharedPreferences. The server never stores or logs the plaintext. Used by `recover-device` to authenticate recovery requests. |
 | app_version | TEXT | NULLABLE | App version string at last sync |
-| status | TEXT | NOT NULL, DEFAULT 'active' | 'active' or 'inactive'. Set to 'inactive' by the dashboard's "Deactivate device" action or by `Deregister Device` on the tablet. Inactive devices do not count toward billing. |
+| activation_state | TEXT | NOT NULL, DEFAULT 'active', CHECK (activation_state IN ('active', 'inactive')) | Device activation state. `'active'`: device is registered and counts toward billing (subject to the 30-day heartbeat window — see §10). `'inactive'`: set by the dashboard's "Deactivate device" action (PRD FR-WD-17), by `Deregister Device` on the tablet (PRD FR-AT-50), or automatically after 60 consecutive days without a heartbeat (see §10 auto-deregistration rule). Inactive devices are rejected by `recover-device` (§4.3) and do not count toward billing. **Renamed from `status` in v3.8 item 3 of 4** to disambiguate from `operators.status` — having two columns named `status` with different semantics (operators is a three-state lifecycle enum; this is a two-state activation flag) was a code-review hazard. The explicit CHECK constraint is database-enforced. |
 | registered_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | When the device first paired |
 | last_seen_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | Updated on every successful sync and by the heartbeat mechanism (§7.7). Drives online/offline status in the dashboard. A device is considered online if this timestamp is within the last 5 minutes. |
 | fcm_token | TEXT | NULLABLE | The FCM registration token for this device. Set during the first successful sync after pairing, when the tablet registers with Firebase and stores the token here. Updated automatically when Firebase rotates the token. Nullable for devices that have not yet completed their first sync. Used by the route-change Edge Function (§7.6) to deliver push notifications. |
-| audio_enabled | BOOLEAN | NOT NULL, DEFAULT true | Whether this device produces audio output. `true` for the designated primary (audio) tablet; `false` for display-only tablets. Default `true` for the first tablet paired to an operator (set by `pair-device` based on existing device count — see §4.2 step 6a); `false` for subsequent tablets. Configurable from the dashboard fleet view. Tablets read this value from their device record after each sync and apply it immediately: if `false`, all audio output (announcements, alert chime, Bluetooth keep-alive) is suppressed for the session; visual display continues normally. |
-| active_route_id | UUID | NULLABLE, FK → routes(id) ON DELETE SET NULL | The route currently active on this device. Updated by the tablet on journey start/end. Used by the dashboard's fleet view. Nullable when no journey is in progress. `ON DELETE SET NULL` ensures that if a route row is hard-deleted from Supabase (see §10 data retention), this FK reference becomes null rather than causing a constraint violation or cascading device deletion. |
+| audio_enabled | BOOLEAN | NOT NULL, DEFAULT true | Whether this device produces audio output. `true` for the designated primary (audio) tablet; `false` for display-only tablets. The DEFAULT of `true` is overridden by `pair-device` on every insert — the function counts existing devices for the operator *before* inserting and sets `audio_enabled = (existing_count = 0)` directly in the INSERT (see §4.2 steps 6–7). The first tablet paired to an operator becomes the audio device; every subsequent tablet defaults to `false`. Configurable from the dashboard fleet view. Tablets read this value from their device record after each sync and apply it immediately: if `false`, all audio output (announcements, alert chime, Bluetooth keep-alive) is suppressed for the session, AND audio downloads are skipped entirely (§7.2 step 7 `audio_enabled` guard); visual display continues normally. A flip from `false → true` is detected during sync (§7.2 step 8) and triggers a cursor reset so audio is back-filled on the next sync. |
+| active_route_id | UUID | NULLABLE, FK → routes(id) ON DELETE SET NULL | The route currently active on this device. Updated by the tablet on journey start/end. Used by the dashboard's fleet view. Nullable when no journey is in progress. `ON DELETE SET NULL` ensures that if a route row is ever hard-deleted from Supabase (a manual administrative action — the initial release does not perform scheduled hard deletes, see §10 data retention), this FK reference becomes null rather than causing a constraint violation or cascading device deletion. |
 
-**Indexes:** `user_id`; `(operator_id, status)` composite; `android_id` (for recovery lookups); `fcm_token` (for push dispatch lookups).
+**Indexes:** `user_id`; `(operator_id, activation_state)` composite; `android_id` (for recovery lookups); `fcm_token` (for push dispatch lookups).
 
 ### 2.3 device_pairing_codes
 
@@ -206,7 +226,8 @@ Route definitions. Each route belongs to one operator. Routes are authored exclu
 | route_number | TEXT | NULLABLE | Optional route number |
 | direction | TEXT | NULLABLE | Direction label: "Outbound", "Return", or custom |
 | return_route_id | UUID | FK → routes(id) DEFERRABLE INITIALLY DEFERRED, NULLABLE | Links to the return route. Deferrable so an outbound + return pair can be inserted in a single transaction. |
-| last_synced_with_return | TIMESTAMPTZ | NULLABLE, DEFAULT NULL | Timestamp set on both routes when a return route is generated (FR-WD-12). Used by the dashboard to detect divergence: if `updated_at > last_synced_with_return` and `return_route_id IS NOT NULL`, the dashboard warns the operator that the linked return route may now be divergent and offers to regenerate it. NULL if no return has ever been generated for this route. |
+| last_synced_with_return | TIMESTAMPTZ | NULLABLE, DEFAULT NULL | Timestamp set on both routes when a return route is generated (FR-WD-12). Retained as a soft audit signal of when the return was last reconciled. **As of v3.8 item 3, this column is no longer the divergence trigger** — divergence detection now compares `stops_content_hash` between the route and its linked return (see column below and PRD FR-WD-12). NULL if no return has ever been generated for this route. |
+| stops_content_hash | TEXT | NULLABLE | SHA-256 hex digest of the canonical serialisation of this route's ordered stop list. Canonical form: for each stop in `stop_order` ascending, the string `"{naptan_id}|{stop_order}"`; the strings joined by newline; UTF-8 bytes hashed with SHA-256; lowercase hex output. Used by the return-route divergence check (PRD FR-WD-12) to detect *structural* changes (stops added, removed, or reordered) without firing on cosmetic edits (direction-label tweak, `route_number` change). The hash is computed and stored by the `replace_route_with_stops` RPC (§4.4) on every save. NULL until the first save under v3.8 item 3. Existing routes acquire a hash on their next save. |
 | updated_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | Server-assigned via trigger on every INSERT or UPDATE. Used as the sync cursor and as the `route_version` segment of the Storage path scheme (§2.8), expressed as epoch milliseconds. |
 | is_deleted | BOOLEAN | NOT NULL, DEFAULT false | Soft delete flag. Deleted routes remain for sync propagation. |
 | audio_render_status | TEXT | NOT NULL, DEFAULT 'pending', CHECK (audio_render_status IN ('pending', 'ok', 'failed')) | Current state of the audio render job for this route version. `pending` immediately after `replace_route_with_stops`. Flipped to `ok` by the audio render worker on successful completion (§4.6); flipped to `failed` after the worker exhausts its retries. The dashboard surfaces this status in the route list (PRD FR-WD-13); the tablet uses it to skip audio download for failed routes (§7.4). |
@@ -247,7 +268,7 @@ One row per completed journey. Holds anonymous count metrics derived from the ta
 | id | UUID | PK, DEFAULT gen_random_uuid() | Unique summary identifier |
 | device_id | UUID | NOT NULL, FK → devices(id) | The device that ran the journey |
 | operator_id | UUID | NOT NULL, FK → operators(id) | Owning operator (RLS scope) |
-| route_id | UUID | NULLABLE, FK → routes(id) ON DELETE SET NULL | The route that was run. Nullable so summaries survive a future hard-delete of the route (see §10 data retention) |
+| route_id | UUID | NULLABLE, FK → routes(id) ON DELETE SET NULL | The route that was run. Nullable so summaries survive any future hard-delete of the route — a manual administrative action; the initial release does not perform scheduled hard deletes (see §10 data retention) |
 | journey_started_at | TIMESTAMPTZ | NOT NULL | Wall-clock journey start (from local `journey_state.journey_started_at`) |
 | journey_ended_at | TIMESTAMPTZ | NOT NULL | Wall-clock journey end |
 | stops_announced_count | INTEGER | NOT NULL, DEFAULT 0 | Count of `STOP_ANNOUNCED` events during the journey |
@@ -337,8 +358,27 @@ route data itself.
   previous version's audio downloaded are unaffected until they next sync.
 - **Cleaned:** A daily scheduled cleanup job (`audio-cleanup-worker`, §4.7) removes all but
   the two most-recent versions per route.
-- **Deleted:** When a route is hard-deleted (data retention cleanup, §10), the entire
+- **Deleted:** If a route is ever hard-deleted (a manual administrative action; the initial
+  release does not perform scheduled hard deletes — see §10 data retention), the entire
   `{operator_id}/{route_id}/` folder — every version — is removed from the bucket.
+
+### 2.9 rate_limit_attempts
+
+Append-only log of rate-limited Edge Function attempts. Used by `pair-device` (§4.2) and `recover-device` (§4.3) to enforce the per-IP and per-Android-ID rate limits specified in those sections. Storing attempt history in a table — rather than in an Edge Function in-memory KV store — keeps the limits durable across Edge Function cold starts and makes the windowed-count queries straightforward SQL.
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| id | UUID | PK, DEFAULT gen_random_uuid() | Row identifier |
+| endpoint | TEXT | NOT NULL, CHECK (endpoint IN ('pair-device', 'recover-device')) | Which Edge Function the attempt was against. The CHECK is database-enforced — adding a new rate-limited endpoint in the future requires extending this constraint deliberately. |
+| key | TEXT | NOT NULL | Per-attempt identifier. Encoded with a self-describing prefix: `ip:<addr>` for IP-keyed limits (e.g. `ip:203.0.113.42`) or `android:<android_id>` for Android-ID-keyed limits (e.g. `android:abc123def456`). The prefix prevents accidental collisions between the two keying classes and makes ad-hoc diagnostic queries readable. |
+| attempted_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | When the attempt happened |
+| succeeded | BOOLEAN | NOT NULL | Whether the attempt succeeded. The rate-limit logic counts failed attempts (`succeeded = false`) within the relevant window. The "double-weight for genuinely invalid codes" behaviour described in §4.2 lives in the `pair-device` function code (e.g. by inserting two rows for that class), not in the table schema. |
+
+**Indexes:** `(endpoint, key, attempted_at DESC)` composite — supports the windowed lookup `SELECT count(*) FROM rate_limit_attempts WHERE endpoint = $1 AND key = $2 AND attempted_at > now() - $window AND NOT succeeded` that the rate-limit logic runs on every attempt.
+
+**RLS:** service-role only. Never read or written by clients directly. The Edge Functions hold the service-role key and perform both INSERTs (recording each attempt) and SELECTs (windowed counts) against this table.
+
+**Cleanup:** Rows older than 24 hours are deleted by the existing daily scheduled cleanup at **03:00 UTC** (alongside the `audio-cleanup-worker` schedule — §4.7 — by adding a `DELETE FROM rate_limit_attempts WHERE attempted_at < now() - interval '24 hours'` step to that scheduled function, or by colocating with `device_pairing_codes` hourly cleanup; the project's scheduled-function inventory determines the most convenient host). 24 hours is well beyond the longest rate-limit window in use (`recover-device` per-IP: 1 hour) and keeps the table small even under sustained traffic.
 
 ---
 
@@ -401,6 +441,8 @@ Tablets authenticate as anonymous Supabase Auth users created during pairing. Th
 
 The tablet's Supabase client refreshes the JWT automatically using the refresh token.
 
+**Anonymous auth-user accumulation (known unbounded growth — MVP-acceptable).** Every `pair-device` call creates a new anonymous Supabase Auth user; every device deactivation flips `devices.activation_state` to `inactive` but **leaves the corresponding `auth.users` row in place**. Across the product's lifetime, retired-device auth-user rows accumulate without bound. At MVP fleet size (small numbers of operators, tens of devices each) the growth is irrelevant — Supabase's MAU limits and storage are well clear. At scale this would become a real operational concern: a future cleanup task should periodically delete `auth.users` rows whose corresponding `devices.activation_state = 'inactive'` and whose last activity is older than a threshold (e.g. 12 months). **Out of scope for the initial release;** recorded here so the awareness is not lost.
+
 ### 3.3 Refresh Token Recovery
 
 If a tablet sits offline long enough that its refresh token expires (typical Supabase default is 7 days; we extend this in project settings to allow weeks/months), the next sync attempt returns a 401. The tablet detects this and silently calls the `recover-device` Edge Function:
@@ -408,13 +450,13 @@ If a tablet sits offline long enough that its refresh token expires (typical Sup
 1. The tablet passes its stored Android ID and plaintext device secret. (No JWT — the device is unauthenticated at this point.)
 2. The function looks up the `devices` row by `android_id`. Rejects with HTTP 404 if not found.
 3. Computes the SHA-256 hash of the provided `device_secret` and compares against the stored `device_secret_hash`. Rejects with HTTP 401 if the hashes do not match. (Uses constant-time comparison to avoid timing attacks.)
-4. Rejects if `devices.status = 'inactive'` or if the linked operator has `status != 'active'`.
+4. Rejects if `devices.activation_state = 'inactive'` or if the linked operator has `status != 'active'`.
 5. Issues a fresh session for the existing anonymous user (`user_id` on the devices row) via the Admin API. The custom access token hook (§3.4a) fires automatically and stamps `operator_id` and `device_id` claims.
 6. Returns `{ access_token, refresh_token, device_id, operator_id }`.
 
 The device row is unchanged; only the auth session is refreshed. The user does not see the pairing screen again.
 
-If `recover-device` fails (device deactivated, secret mismatch, row missing), the tablet shows a clear message and returns to the first-run setup screen for re-pairing.
+If `recover-device` fails, the tablet's behaviour depends on whether the failure is **terminal** (device row missing, secret mismatch, device inactive, operator disabled) or **transient** (5xx, network error, rate-limited). Terminal failures wipe cached credentials and return to first-run setup; transient failures retain credentials and retry silently on the next sync. See PRD FR-AT-04 and the "Failure classification" subsection of §4.3 below for the full split.
 
 ### 3.4a JWT Custom Claims
 
@@ -559,23 +601,25 @@ Edge Functions encapsulate operations that require service-role access or non-tr
 **Behaviour:**
 1. Look up the pairing code by the `code` column (not by PK); reject if not found, expired, or already used.
 2. Reject if the operator linked to the code has `status != 'active'`.
-3. Create a new anonymous Supabase Auth user via the Admin API, setting `app_metadata: { role: 'device', operator_id: '<UUID>' }` (device_id is added in step 6 once the devices row UUID is known).
+3. Create a new anonymous Supabase Auth user via the Admin API, setting `app_metadata: { role: 'device', operator_id: '<UUID>' }` (device_id is added in step 8 once the devices row UUID is known).
 4. Generate a cryptographically random 256-bit device secret: `crypto.getRandomValues(new Uint8Array(32))`, base64url-encoded (43 chars).
 5. Compute the SHA-256 hash of the plaintext secret (hex-encoded string).
-6. Insert a `devices` row with the new `user_id`, `operator_id` from the code, the `android_id` from the request, the `device_secret_hash`, and default `display_name` "New Device #N" where N is one more than the operator's current device count.
-6a. Set `audio_enabled` on the new devices row: query the count of existing active (non-newly-inserted) devices for this operator. If count = 0, set `audio_enabled = true` (this is the first tablet — it is the default primary). If count ≥ 1, set `audio_enabled = false`. This implements the default audio designation without requiring fleet manager action for single-tablet deployments.
-7. Update the anonymous user's `app_metadata` to add `device_id` (the UUID of the newly created devices row).
-8. Mark the pairing code as used (`used_at = now()`).
-9. Create a session for the anonymous user via the Admin API. The custom access token hook (§3.4a) fires automatically and stamps `operator_id` and `device_id` claims.
-10. Return `{ access_token, refresh_token, device_id, operator_id, operator_name, device_secret }`. The `device_secret` is the plaintext value — included in this response only. The server does not log or retain it after the response is sent.
+6. **Count existing devices for this operator first.** Query `SELECT count(*) FROM devices WHERE operator_id = $op_id` and hold the result as `existing_count`. This must be done **before** the INSERT in step 7 — querying the count *after* the insert would always return ≥ 1 and silently flip every first-paired device's `audio_enabled` to `false`.
+7. Insert a `devices` row in a single statement with: the new `user_id`, `operator_id` from the code, the `android_id` from the request, the `device_secret_hash`, default `display_name = "New Device #N"` where `N = existing_count + 1`, and **`audio_enabled = (existing_count = 0)`** — true for the first tablet paired to this operator, false for every subsequent tablet. The column's DEFAULT of `true` (§2.2) is overridden by this explicit value on every insert; no post-insert UPDATE is performed.
+8. Update the anonymous user's `app_metadata` to add `device_id` (the UUID of the newly created devices row).
+9. Mark the pairing code as used (`used_at = now()`).
+10. Create a session for the anonymous user via the Admin API. The custom access token hook (§3.4a) fires automatically and stamps `operator_id` and `device_id` claims.
+11. Return `{ access_token, refresh_token, device_id, operator_id, operator_name, device_secret }`. The `device_secret` is the plaintext value — included in this response only. The server does not log or retain it after the response is sent.
 
 Failure modes are handled cleanly: invalid code returns a clear error message; transient errors trigger a retry on the tablet.
 
+**Integration-test requirement (audio_enabled regression).** A test must pair the very first device for a freshly-created operator and assert that the resulting `devices.audio_enabled = true`. This regression-tests the count-before-insert ordering — a naïve `SELECT count(*) … WHERE operator_id = $1` issued *after* the insert would always return ≥ 1 and silently flip every first device to `audio_enabled = false`, violating the §5.2 PRD claim that single-tablet operators require no configuration.
+
 **Rate limiting:** To prevent brute-force enumeration of the 6-digit pairing code space, `pair-device` enforces:
-- **Per-IP:** max 10 attempts per 10-minute window. Tracked in a `rate_limit_attempts` table (or Edge Function KV store) keyed by IP + function name + window bucket.
+- **Per-IP:** max 10 attempts per 10-minute window. Tracked in the `rate_limit_attempts` table (§2.9) — each attempt inserts a row with `endpoint = 'pair-device'`, `key = 'ip:' || <caller_ip>`, and `succeeded` set per the outcome. The window check is `SELECT count(*) FROM rate_limit_attempts WHERE endpoint = 'pair-device' AND key = 'ip:' || $ip AND attempted_at > now() - interval '10 minutes' AND NOT succeeded`.
 - **Exponential backoff:** after 3 consecutive failures from the same IP within 60 seconds, subsequent attempts receive HTTP 429 with a `Retry-After` header. Back-off intervals: 5 s, 15 s, 60 s for attempts 4, 5, 6+.
-- Failures against valid-but-already-used or expired codes count toward the limit; failures against genuinely invalid codes count at double weight.
-- Rate limit state resets when a new 10-minute window begins.
+- Failures against valid-but-already-used or expired codes count toward the limit; failures against genuinely invalid codes count at double weight (implemented by inserting two `rate_limit_attempts` rows for that class).
+- Rate limit state resets when a new 10-minute window begins (older rows fall out of the windowed `count(*)` automatically; the §2.9 24-hour cleanup eventually deletes them).
 
 ### 4.3 recover-device
 
@@ -587,14 +631,15 @@ Failure modes are handled cleanly: invalid code returns a clear error message; t
 **Behaviour:**
 1. Look up the `devices` row by `android_id`. Reject with HTTP 404 if not found.
 2. Compute the SHA-256 hash of the provided `device_secret`. Compare against the stored `device_secret_hash` using a constant-time comparison. Reject with HTTP 401 if the hashes do not match.
-3. Reject if `devices.status = 'inactive'` or if the linked operator has `status != 'active'`.
+3. Reject if `devices.activation_state = 'inactive'` or if the linked operator has `status != 'active'`.
 4. Issue a fresh session for the device's `user_id` via the Admin API. The custom access token hook (§3.4a) fires automatically and stamps `operator_id` and `device_id` claims.
 5. Return `{ access_token, refresh_token, device_id, operator_id }`.
 
+**Failure classification (consumed by the tablet — see PRD FR-AT-04).** The tablet treats `recover-device` outcomes as either *terminal* (HTTP 404 device-row-missing; HTTP 401 secret-mismatch; HTTP response indicating `activation_state = 'inactive'` or operator-disabled) or *transient* (HTTP 5xx, network errors, HTTP 429 rate-limit, anything else). On terminal failures the tablet wipes cached credentials and returns to first-run pairing; on transient failures the tablet retains its cached JWT/refresh token/device secret and retries on the next sync. The endpoint itself returns the same shape regardless — the classification lives in the caller. This split exists to keep a working in-service tablet operating through transient Supabase/FCM/network blips rather than dropping it into a pairing-code-required state on a bus mid-journey.
+
 **Rate limiting:** `recover-device` is an unauthenticated endpoint. To limit brute-force attempts against the device secret:
-- **Per-Android-ID:** max 5 attempts per hour. After 3 consecutive failures (wrong secret or inactive device), lock out that Android ID for 15 minutes.
-- **Per-IP:** max 20 attempts per hour across all Android IDs from that IP.
-- Both limits tracked in the `rate_limit_attempts` table or Edge Function KV store.
+- **Per-Android-ID:** max 5 attempts per hour. After 3 consecutive failures (wrong secret or inactive device), lock out that Android ID for 15 minutes. Tracked in `rate_limit_attempts` (§2.9) with `endpoint = 'recover-device'` and `key = 'android:' || <android_id>`.
+- **Per-IP:** max 20 attempts per hour across all Android IDs from that IP. Tracked in the same table with `key = 'ip:' || <caller_ip>`.
 - HTTP 429 with `Retry-After` on breach.
 - A legitimate recovery (tablet returning after months offline) succeeds on the first attempt; these limits only prevent systematic brute-force.
 
@@ -611,8 +656,11 @@ where `route_input` is a composite type matching the routes table columns. Each 
 1. UPSERT the route row (insert or update by id).
 2. DELETE all existing route_stops for that route_id.
 3. INSERT the stops from the JSON array.
+4. Compute `stops_content_hash` from the just-inserted stops (canonical form: for each stop in `stop_order` ascending, the string `"{naptan_id}|{stop_order}"`; the strings joined by newline; UTF-8 bytes hashed with SHA-256; lowercase hex output). `UPDATE routes SET stops_content_hash = $1 WHERE id = $route_id`.
 
-The server's `updated_at` trigger fires automatically on the route UPSERT.
+The server's `updated_at` trigger fires on the route UPSERT (step 1) and again on the hash UPDATE (step 4), but the cursor is server-authoritative so the final `updated_at` is still well-defined within the transaction.
+
+**stops_content_hash semantics.** `updated_at` changes on every save (it is the sync cursor — and that is correct). `stops_content_hash` only changes when the structural stop list actually changes (stop added/removed/reordered, or a stop's `naptan_id` changes). A route metadata edit (renaming the route, changing `route_number`, changing `direction`, toggling `audio_enabled` elsewhere) writes the same stops, hashes to the same value, and leaves `stops_content_hash` unchanged. PRD FR-WD-12 relies on this property to fire the return-route divergence warning only on structural drift, avoiding warning fatigue.
 
 This RPC is what the dashboard calls when saving a route.
 
@@ -811,8 +859,15 @@ The cleanup job is idempotent — running it more than once a day is harmless be
 recomputes the keep-set independently. Failure within a day is logged but not retried inside
 the same day; the next day's run picks up the missed work.
 
-Hard-deletion of a route (data retention cleanup, §10) overrides this policy and removes all
-versions for that route.
+**Soft-deleted routes.** When a route is soft-deleted (`routes.is_deleted = true`), the
+two-version retention still applies — both surviving versions remain in place. A future
+cleanup pass may delete all audio versions for soft-deleted routes after a longer retention
+window; the initial release leaves them in place, which is simpler and still bounded by the
+two-version cap.
+
+**Manual hard-delete of a route** (a deliberate administrative action; the initial release
+does **not** perform scheduled hard deletes, see §10) removes all versions for that route in
+the same pass that removes the row.
 
 ### 4.5 get_routes_since
 
@@ -881,7 +936,7 @@ Diagnostic event log. Not synced. Auto-pruned after 30 days.
 | Column | Type | Constraints | Description |
 |---|---|---|---|
 | id | LONG | PK, AUTO-INCREMENT | Local auto-incrementing ID |
-| event_type | TEXT | NOT NULL | JOURNEY_START, JOURNEY_END, STOP_ANNOUNCED, STOP_PASSED_WITHOUT_DETECTION, STOP_SKIPPED, HAIL_AND_RIDE_SECTION_STARTED, HAIL_AND_RIDE_SECTION_ENDED, DIVERSION_STARTED, DIVERSION_ENDED, GPS_LOST, GPS_REGAINED, AUDIO_DISCONNECTED, AUDIO_RECONNECTED, AUDIO_FILE_MISSING, AUDIO_PLAYBACK_ERROR, CLOCK_DRIFT, SYNC_SUCCESS, SYNC_FAILURE, APP_ERROR |
+| event_type | TEXT | NOT NULL | JOURNEY_START, JOURNEY_END, JOURNEY_AUTO_CLEARED, STOP_ANNOUNCED, STOP_PASSED_WITHOUT_DETECTION, STOP_SKIPPED, HAIL_AND_RIDE_SECTION_STARTED, HAIL_AND_RIDE_SECTION_ENDED, DIVERSION_STARTED, DIVERSION_ENDED, DIVERSION_REPLAYED, GPS_LOST, GPS_REGAINED, AUDIO_DISCONNECTED, AUDIO_RECONNECTED, AUDIO_FILE_MISSING, AUDIO_PLAYBACK_ERROR, GMS_OVERRIDE_ACKNOWLEDGED, CLOCK_DRIFT, SYNC_SUCCESS, SYNC_FAILURE, APP_ERROR. `JOURNEY_AUTO_CLEARED` is logged when journey state is cleared on recovery due to staleness (PRD FR-AT-18; `detail` = `'stale_age'` or `'stale_no_events'`). `DIVERSION_REPLAYED` is logged when the diversion-start announcement is replayed on journey recovery (PRD FR-AT-18; `detail` = `'recovery'`). `GMS_OVERRIDE_ACKNOWLEDGED` is logged when the user dismisses the GMS unavailability block (PRD FR-AT-67; `detail` = GMS status code, e.g. `'SERVICE_MISSING'`). |
 | route_id | TEXT | NULLABLE | Route ID if relevant |
 | stop_name | TEXT | NULLABLE | Stop name if relevant |
 | trigger_method | TEXT | NULLABLE | "GPS" (normal proximity entry), "GPS_INFERRED" (stop auto-advanced via two-stop look-ahead without direct proximity entry), or "MANUAL" for stop announcements. `STOP_SKIPPED` events use trigger_method = "DRIVER_DIVERSION". `HAIL_AND_RIDE_SECTION_STARTED` and `HAIL_AND_RIDE_SECTION_ENDED` use trigger_method = "GPS" (automatic boundary detection) or "MANUAL" (driver fallback). |
@@ -897,10 +952,21 @@ Persists the active journey state for crash recovery. Single-row table.
 | id | INTEGER | PK, hardcoded to 1 | Enforced via `@PrimaryKey(autoGenerate = false)` and `@Insert(onConflict = REPLACE)` in the DAO. Prevents duplicate-insert crashes. |
 | route_id | TEXT | NOT NULL | The active route |
 | current_stop_index | INTEGER | NOT NULL | 0-based index of the current/next stop |
-| journey_started_at | LONG | NOT NULL | Epoch millis when the journey began |
-| is_active | BOOLEAN | NOT NULL | True during a journey. On app restart, if true, the journey is resumed. |
+| journey_started_at | LONG | NOT NULL | Epoch millis when the journey began. Read by the staleness check on app launch (see "Recovery staleness rules" below) — a journey older than `JOURNEY_STATE_MAX_AGE_HOURS` is auto-cleared rather than resumed. |
+| is_active | BOOLEAN | NOT NULL | True during a journey. On app restart, if true, the journey is resumed **subject to the staleness check below** — a stale residue from a prior shift is auto-cleared, not resumed. |
 
 **Note on diversion state:** Skipped stops for an active diversion are stored in the `journey_skipped_stops` table (§5.7), not in this row, to keep the single-row design clean and support fast indexed lookup.
+
+**Recovery staleness rules (PRD FR-AT-18).** When the app launches and finds `is_active = true`, two thresholds gate the resume decision:
+
+- `JOURNEY_STATE_MAX_AGE_HOURS = 8` — covers a full driving shift. A journey whose `journey_started_at` is more than 8 hours ago is by definition a stale residue from a prior day (the app was killed before journey-end and the tablet sat unused overnight).
+- `JOURNEY_EVENT_RECENCY_THRESHOLD_HOURS = 1` — a healthy in-service tablet logs `STOP_ANNOUNCED`, `GPS_LOST`, or similar events frequently. A full hour with no `journey_events` row since `journey_started_at` strongly indicates the bus has stopped operating without a clean shutdown.
+
+Recovery algorithm (see PRD FR-AT-18 for the full FR specification):
+
+1. If `now() - journey_started_at > JOURNEY_STATE_MAX_AGE_HOURS`: clear `is_active = false`, clear `journey_skipped_stops`, log `JOURNEY_AUTO_CLEARED` with `detail = 'stale_age'`, return to route list.
+2. Else if no `journey_events` row exists with `timestamp_utc >= journey_started_at`, or the most recent such row's `timestamp_utc` is older than `now() - JOURNEY_EVENT_RECENCY_THRESHOLD_HOURS`: clear as above with `detail = 'stale_no_events'`.
+3. Else: resume the journey. If `journey_skipped_stops` is non-empty, replay the diversion start announcement before re-arming the GPS state machine (PRD FR-AT-18 diversion-replay step).
 
 **Note on single-row design and multi-tablet future:** The single-row design (one active journey per device) is correct for the initial release. Each tablet is an independent device with its own journey state; there is no shared journey state between tablets in the initial release (see PRD §5.2). The PRD §5.2 gestures at a future "primary-secondary tablet linking with shared journey state" feature. That feature would require a fundamentally different architecture — journey state would need to be a Supabase Realtime-projected record rather than a local single-row table. That redesign is deliberately deferred. The single-row `journey_state` table is the correct, intentional design for the initial release scope.
 
@@ -1069,13 +1135,14 @@ Note: the heartbeat (§7.7) is a separate mechanism from route sync. It updates 
 5. Update `sync_metadata.last_server_timestamp` to the `server_now` returned by the RPC.
 6. Update `sync_metadata.last_sync_at` and set `sync_status = 'synced'`.
 7. **Download audio files (version-keyed):** For each route UPSERT'd in step 3 (not deleted), download audio files from Supabase Storage to local file storage (§6.4) using the route's version-keyed path scheme (§2.8):
+   - **audio_enabled guard (first).** Before iterating routes for audio download, read the local device's `audio_enabled` value from the most recently synced `devices` row. **If `audio_enabled = false`, skip the entire audio-download step** — no `route_announcement.mp3` or `stop_{N}.mp3` is downloaded. Display-only tablets do not need route audio and do not waste storage or cellular bandwidth fetching it. Route data and `route_stops` are still downloaded normally (steps 1–6 above); only this audio-download step is skipped.
    - **Render-status guard.** If the route's `audio_render_status = 'failed'`, do **not** attempt any audio download for it — the version-keyed path will not exist in Storage and the request would 404. Log `AUDIO_FILE_MISSING` once with `detail = 'render_failed'` and move on. The "Audio not ready" indicator (§6.4) continues to gate journey starts. If `audio_render_status = 'pending'`, also defer download — a future sync (after the render worker completes) will see `ok`.
    - **For routes with `audio_render_status = 'ok'`:** compute `route_version` as the route's `updated_at` in epoch millis. The expected file list is `route_announcement.mp3` plus `stop_{N}.mp3` for each stop, all under `{operator_id}/{route_id}/{route_version}/`.
    - If the route was updated in this sync (it appears in the `get_routes_since` response), the path's `route_version` segment has changed; download all audio files for the new version into a fresh local `{route_id}/{route_version}/` directory (see §6.4 layout note). The previous local version directory is removed once the new download completes successfully.
    - If a file is missing locally for the current version, download it.
    - The tablet pulls audio for the specific route version it just synced; older or newer Storage versions are not pulled. If the dashboard saves the route again while the tablet is mid-download, the tablet completes its download of the version it asked for; the next sync round picks up the newer version.
    - Audio download failures (network drop, 404 on a partially-rendered version) are non-fatal: log `AUDIO_FILE_MISSING` to journey_events, continue sync. The route shows "Audio not ready" until the next successful download.
-8. Update the device's `last_seen_at` in Supabase (separate query).
+8. Update the device's `last_seen_at` in Supabase (separate query). **Detect `audio_enabled` flip from `false` → `true`.** During this step the tablet also re-reads its own `devices` row and compares the freshly synced `audio_enabled` against the value held immediately before this sync. If it has flipped from `false` to `true`, set `sync_metadata.last_server_timestamp = 0` so that the **next** sync trigger re-pulls every current route — at which point the (now `true`) `audio_enabled` guard in step 7 above lets the audio-download step run and back-fills audio for every route the tablet holds. The flip-detection happens here; the back-fill happens on the next sync, keeping the current sync's semantics simple. The reverse flip (`true → false`) does not delete already-downloaded audio in the initial release — it is dead but harmless on disk and is reclaimed on the next route delete or app reinstall.
 
 ### 7.4 Sync Algorithm — Full Sequence
 
@@ -1087,7 +1154,7 @@ Note: the heartbeat (§7.7) is a separate mechanism from route sync. It updates 
      - `status = 'suspended'`: display "Account Suspended — please contact your bus company administrator" and abort.
      - `status = 'active'`: clear any previously captured `pending_account_status` and continue.
 3. **Download** remote route and stop changes per section 7.2 steps 1–6. The route rows pulled by `get_routes_since` carry the new `audio_render_status` and `audio_render_error` columns (§2.4); these are written into the local Room `routes` mirror (§5.1) and used by the audio-download step below.
-4. **Download audio files** per section 7.2 step 7, using version-keyed paths derived from each route's `updated_at` and skipping any route whose `audio_render_status` is `failed` or `pending`. Audio download runs after route data is committed to Room. Audio failures do not fail the sync — routes are updated even if audio files are temporarily unavailable.
+4. **Download audio files** per section 7.2 step 7, using version-keyed paths derived from each route's `updated_at` and skipping any route whose `audio_render_status` is `failed` or `pending`. Audio download runs after route data is committed to Room. Audio failures do not fail the sync — routes are updated even if audio files are temporarily unavailable. **Display-only tablets (`audio_enabled = false`) skip this step entirely** per the §7.2 step 7 `audio_enabled` guard; route data is still synced normally.
 5. **Upload pending journey summaries** per §7.8. Failures here are non-fatal — rows remain in `journey_summaries_pending` for the next sync.
 6. Set `sync_metadata.sync_status = 'synced'`.
 7. Update `devices.active_route_id` if a journey is in progress.
@@ -1113,15 +1180,39 @@ reaches tablets only on their next regular sync trigger.
 
 **Dispatcher.** The dispatcher itself is a small server-side function (callable by the worker
 via service-role HTTP) that:
-1. Takes a `route_id` as input.
+1. Takes `(route_id, trigger)` as input, where `trigger` is `'route-updated'` or `'route-deleted'`.
 2. Queries `routes` to resolve `operator_id`.
-3. Queries `devices` for all active devices belonging to that operator with a non-null
-   `fcm_token`.
-4. Sends an FCM message to each device's FCM token with a simple payload signalling "routes
-   have changed."
+3. Queries `devices` for all devices belonging to that operator with `activation_state = 'active'` AND `fcm_token IS NOT NULL`. Inactive devices and devices that have not yet registered an FCM token are skipped.
+4. Sends an FCM **data-only message** (see payload spec below) to each device's FCM token.
 
-The dispatcher shape is unchanged from earlier versions; only the call site has moved (from
-a DB trigger on `routes.updated_at` to the audio render worker's success branch).
+The dispatcher shape is unchanged from earlier versions in its mechanics; the payload shape
+and the dispatch filter (`activation_state = 'active'`) are made explicit here.
+
+**Payload (data-only message).** FCM messages are sent as Android **data messages**, not
+notification messages. A data-only message wakes the app to handle the payload in code; a
+notification-with-data message would render a system tray notification when the app is
+backgrounded, which is wrong for a kiosked always-foregrounded application. Payload shape:
+
+```json
+{
+  "data": {
+    "type": "route-sync",
+    "operator_id": "<uuid>",
+    "trigger": "route-updated"
+  }
+}
+```
+
+- `type` — fixed string `"route-sync"`. Future message classes (if ever added) would use a
+  different value; the Android handler dispatches on `type` and ignores unknown values
+  defensively.
+- `operator_id` — the owning operator's UUID. The Android FCM handler validates this against
+  the locally-stored `operator_id` and ignores any message whose `operator_id` does not
+  match. In practice each device's FCM token is operator-specific by registration, but the
+  explicit check is defence-in-depth against misrouted messages and costs nothing.
+- `trigger` — informational only; one of `"route-updated"` or `"route-deleted"`. Useful for
+  Sentry breadcrumbs and operational diagnostics. The handler does not branch on this
+  value — every `route-sync` message produces the same response (trigger an immediate sync).
 
 Tablets register their FCM registration token in `devices.fcm_token` (see §2.2) during the
 first successful sync after pairing. The token is re-registered whenever Firebase rotates it.
@@ -1430,9 +1521,10 @@ At journey end, the tablet writes a single anonymous-count summary row to local 
 |---|---|---|
 | Journey events (local) | 30 days | Auto-deleted on app startup |
 | Used/expired pairing codes | 1 hour | Scheduled cleanup function in Supabase |
-| Soft-deleted routes | Indefinite in Supabase | Could be hard-deleted after 90 days (operations decision); hard-deletion removes all audio versions for the route from Storage |
-| Journey state (local) | Cleared on journey end | is_active = false when journey completes; pending_deletion cleanup runs here too |
-| Inactive devices | Indefinite in Supabase | Could be auto-deregistered after extended inactivity (operations decision) |
+| Soft-deleted routes | Indefinite in Supabase | **No scheduled hard delete in the initial release.** Soft-deleted routes are retained indefinitely so that `get_routes_since` always propagates the deletion to every tablet that hasn't yet seen it. Hard deletion would silently strand routes on tablets that synced before the delete (`get_routes_since` cannot return rows that no longer exist) — tombstone-table alternatives are over-engineering for the data volumes involved. A manual administrative hard-delete remains possible (and the schema's `ON DELETE SET NULL` / `ON DELETE CASCADE` rules cover it cleanly) but is not part of automated retention. |
+| Journey state (local) | Cleared on journey end **or on stale-recovery auto-clear (PRD FR-AT-18)** | `is_active = false` when journey completes; pending_deletion cleanup runs here too. On app launch, journey state older than 8 hours or with no `journey_events` activity in the last hour is auto-cleared (see §5.5 staleness rules; logs `JOURNEY_AUTO_CLEARED`). |
+| Active vs auto-deregistered devices | **30 days heartbeat-billable; 60 days auto-deregister** | A scheduled daily job (sharing the 03:00 UTC cleanup window) sets `devices.activation_state = 'inactive'` for any device whose `last_seen_at` is older than `now() - interval '60 days'`. Billing reports exclude any device whose `last_seen_at` is older than `now() - interval '30 days'`, regardless of `activation_state`. **`last_seen_at` is the source of truth** — maintained by the heartbeat mechanism (§7.7 / PRD FR-AT-64) rather than by route sync alone. The 30-day grace gives operators a buffer for seasonal or in-repair tablets; the 60-day cutoff bounds the lifetime of dormant rows. This pairing reconciles PRD §1.4 (billing) with this retention policy; previously these numbers were "operations decisions" and uncoordinated. |
+| Anonymous Supabase Auth users | Indefinite (known unbounded growth) | Every pair-device creates a new anonymous `auth.users` row; device deactivation flips `devices.activation_state = 'inactive'` but does not remove the auth user. MVP-acceptable at projected fleet size; a future cleanup task (delete `auth.users` rows for `inactive` devices with no activity in the last 12 months) is recorded as out-of-scope but acknowledged — see §3.2 paragraph. |
 | Route audio (Storage) | Two most-recent versions per route | Daily `audio-cleanup-worker` (§4.7) at 03:00 UTC; older `{route_version}` paths removed |
 | pg_boss jobs | 7 days after completion or terminal failure | `retentionDays: 7` on the `render-route-audio` queue (§4.6); pg_boss archives to `pgboss.archive` then prunes |
 | Journey summaries (Supabase) | Indefinite | Operator-visible in the dashboard per-device drill-down (PRD FR-WD-23). No automatic deletion; the system administrator may prune via service role if storage cost ever becomes a concern. No PII to protect. |
@@ -1572,12 +1664,27 @@ deployment):
    `supabase secrets set`.
 2. Configure FCM credentials (server key) per existing setup; store as `FCM_SERVER_KEY`.
 3. Run the one-off `pgboss-install` Edge Function to create the `pgboss` schema and tables.
-4. Schedule `audio-render-worker` (`* * * * *`) and `audio-cleanup-worker` (`0 3 * * *`) via
-   Supabase's scheduled functions.
-5. Complete the Reg 13(4) voice-frequency verification described in the Compliance Mapping
+4. **Register the custom access token hook (Supabase Auth).** After running the database
+   migration that creates the `custom_access_token_hook` function (§3.4a), navigate to
+   **Supabase Dashboard → Authentication → Hooks → Custom Access Token Hook** and select
+   the `custom_access_token_hook` function. Save. **Verify** by signing in a test user
+   (dashboard signup or test device pairing) and inspecting the issued JWT (e.g. via
+   <https://jwt.io>): the payload must contain an `operator_id` claim (and for device
+   tokens, also `device_id`). The hook is a Supabase Auth configuration setting, **not**
+   a database object — it does not travel in SQL migrations and must be set manually on
+   every fresh environment (production, staging, local Supabase, recovery environments).
+   Absence of the hook causes silent RLS failures: every RLS-scoped query returns an
+   empty result set for valid-looking JWTs because the policies' `(auth.jwt()->>'operator_id')`
+   resolves to NULL. This is by far the most common cause of an apparently-broken-but-not-erroring
+   fresh deployment.
+5. Schedule `audio-render-worker` (`* * * * *`) and `audio-cleanup-worker` (`0 3 * * *`) via
+   Supabase's scheduled functions. Add the daily `rate_limit_attempts` cleanup (§2.9) and the
+   daily 60-day device auto-deregistration (§10) to the existing 03:00 UTC scheduled
+   function rather than creating new schedules.
+6. Complete the Reg 13(4) voice-frequency verification described in the Compliance Mapping
    Matrix and record the result in the operations runbook before serving any production
    traffic.
-6. Create three Sentry projects (Android, Dashboard, Edge Functions) and provision their
+7. Create three Sentry projects (Android, Dashboard, Edge Functions) and provision their
    DSNs (§11.2). Store `SENTRY_DSN_EDGE` as a Supabase secret; configure
    `SENTRY_DSN_DASHBOARD` in Vercel; inject `SENTRY_DSN_ANDROID` into the Android build
    config. This is a one-off task at Stage 2/3 start (when the Android app and dashboard

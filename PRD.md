@@ -7,6 +7,22 @@
 
 ## Changelog
 
+### v3.8 (May 2026 — item 3 of 4)
+Round-2 post-adversarial-review re-planning pass, item 3 of 4 (missing-detail fixes and small bugs).
+- §1.4: Pinned billing and auto-deregistration to a coordinated **30-day billable / 60-day auto-deregister** rule, both driven by `devices.last_seen_at` (heartbeat) rather than the older "synced in last 30 days" wording. Reconciles with Data Architecture §10.
+- FR-WD-12: Divergence detection rewritten around `routes.stops_content_hash` (structural comparison) instead of the timestamp comparison that fired on every save. Eliminates warning fatigue.
+- FR-WD-17: `devices.status` → `devices.activation_state` rename reflected; added auto-deactivation reference.
+- FR-AT-04: Split `recover-device` failure handling into **transient** (5xx, network, 429 — retain cached credentials, retry) and **terminal** (404, 401, inactive/disabled — wipe and re-pair). Stops a transient network blip from dropping an in-service tablet to the pairing screen.
+- FR-AT-11: Added `journey_events` cleanup at journey start; gated the "Start Journey" button on FR-AT-67 GMS availability.
+- FR-AT-13: GPS accuracy gate clarified as **per-candidate** (evaluated independently for stop N and stop N+1 against their own radii) with a worked example.
+- FR-AT-18: Added recovery staleness rules (constants `JOURNEY_STATE_MAX_AGE_HOURS = 8` and `JOURNEY_EVENT_RECENCY_THRESHOLD_HOURS = 1`) — stale state is auto-cleared rather than resumed. Added diversion-announcement replay step when resuming with a non-empty `journey_skipped_stops`.
+- FR-AT-28: Display-only tablets (`audio_enabled = false`) skip the journey-start audio gate because they skip audio downloads entirely.
+- FR-AT-50: `devices.status` → `devices.activation_state` rename reflected.
+- FR-AT-55: Display-only tablets skip audio downloads entirely (cross-reference to Data Architecture §7.2 `audio_enabled` guard).
+- FR-AT-63: `journey_events` cleanup now also runs at every journey start (in addition to app startup) — bounds pruning latency on kiosked tablets that never restart.
+- FR-AT-67 (new): **Google Mobile Services Availability Check** — runtime detection of non-GMS tablets. Blocks journey starts with a clear warning; has a "continue anyway" override for development/testing (logged to `journey_events`).
+- §11.1 assumption 9: Added parenthetical referencing FR-AT-67 (runtime enforcement of the GMS assumption).
+
 ### v3.8 (May 2026 — item 2 of 4)
 Round-2 post-adversarial-review re-planning pass, item 2 of 4 (bug fixes and operational hardening: heartbeat lifecycle redesign, honest audio_enabled compliance framing, mid-journey suspension grace, Sentry telemetry, journey-summary upload).
 - FR-AT-64: Heartbeat rewritten around `ProcessLifecycleOwner`. Two paths reframed as "app-foregrounded" (reliable, ticks whenever any Activity is RESUMED — covers route browsing, route detail, admin menu, and active journeys) and "background/idle" (best-effort WorkManager). Foreground GPS service is no longer the heartbeat owner.
@@ -133,7 +149,9 @@ A SaaS software product that runs on operator-supplied Android tablets paired wi
 
 ### 1.4 Business Model
 
-Monthly subscription, charged per active tablet. Initial pricing target: £30–50 per tablet per month. Billing is handled manually (invoice) for the initial customer set; automated billing via Stripe is planned for a later release once pricing is validated and the customer count justifies the integration cost. A device is considered active if it has synced within the last 30 days.
+Monthly subscription, charged per active tablet. Initial pricing target: £30–50 per tablet per month. Billing is handled manually (invoice) for the initial customer set; automated billing via Stripe is planned for a later release once pricing is validated and the customer count justifies the integration cost.
+
+**Billable vs deregistered.** A device is **billable** if its `devices.last_seen_at` (maintained by the heartbeat mechanism, FR-AT-64 — not by route-sync recency alone) is within the last **30 days**. Devices that have been silent for more than 30 consecutive days are not invoiced. After **60 consecutive days** without a heartbeat, a scheduled job automatically sets `devices.activation_state = 'inactive'` (auto-deregistration); from that point the device must re-pair to function again. The 30-day grace gives operators a buffer for seasonal or in-repair tablets without surprise billing; the 60-day cutoff bounds the lifetime of dormant rows. The 30/60-day pair is the source of truth for both billing and lifecycle (see Data Architecture §10 for the schema-level rule).
 
 ### 1.5 Target Market
 
@@ -236,7 +254,11 @@ Operators can edit existing routes (rename, reorder stops, add/remove stops, cha
 **FR-WD-12: Return Route Generation**
 When saving a route, the dashboard offers a "Generate return route" action that creates a separate route entity with the same stops in reverse order and the direction label flipped. The two routes are linked via `return_route_id` so each can navigate to its counterpart. The two routes can be edited independently after generation.
 
-**Return-route divergence detection:** Once a return route has been generated and either route is subsequently edited, the routes may diverge (different stops, different order). To surface this, each route carries a `last_synced_with_return` timestamp (see Data Architecture §2.4). When a return route is generated, both routes have `last_synced_with_return` set to the moment of generation. On the dashboard, when an operator saves an edit to a route that has a `return_route_id` AND the route's `updated_at` is newer than its `last_synced_with_return`, the dashboard displays a warning: *"This route has a linked return route that may now be divergent. [Re-generate return route] [Keep existing return]."* Choosing [Re-generate] replaces the linked return route's stop list with the current route's stops in reverse order, resets `last_synced_with_return` on both routes, and triggers audio re-rendering for the return route. Choosing [Keep existing return] dismisses the warning without further action. This is a warning-and-regenerate mechanism, not a diff UI. The operator is responsible for reviewing the linked route if they choose to keep it.
+**Return-route divergence detection (structural — `stops_content_hash`):** Once a return route has been generated and either route is subsequently edited, the routes may diverge structurally (stops added, removed, or reordered). The detection mechanism compares **structural content**, not timestamps. Each route carries a `stops_content_hash` — SHA-256 of the canonical serialisation of its ordered stop list (see Data Architecture §2.4 and §4.4) — maintained by the `replace_route_with_stops` RPC on every save. A direction-label tweak, `route_number` change, or any other non-stop edit produces the same hash and does **not** fire the warning. A stop add/remove/reorder produces a different hash and **does** fire it.
+
+On the dashboard, when an operator saves an edit to a route that has a `return_route_id` AND the route's `stops_content_hash` no longer matches the linked return's `stops_content_hash` after reverse-order normalisation (i.e. the route's hash differs from the hash of the linked return's stops in reversed order — what the return *should* be), the dashboard displays a warning: *"This route has a linked return route that may now be divergent. [Re-generate return route] [Keep existing return]."* Choosing [Re-generate] replaces the linked return route's stop list with the current route's stops in reverse order, recomputes `stops_content_hash` on both routes (via `replace_route_with_stops`), resets `last_synced_with_return` to `now()` on both routes for the audit trail, and triggers audio re-rendering for the return route. Choosing [Keep existing return] dismisses the warning without further action. This is a warning-and-regenerate mechanism, not a diff UI. The operator is responsible for reviewing the linked route if they choose to keep it.
+
+**Why structural, not timestamp-based.** The previous mechanism compared `updated_at > last_synced_with_return`. Because the `routes` `updated_at` trigger fires on every UPDATE — including a trivial direction-label tweak — the warning would fire on every save after generation, producing warning fatigue and training operators to dismiss it without reading. The `stops_content_hash` mechanism fires only when the divergence is real. The `last_synced_with_return` column is retained as a soft audit timestamp (when was the return last reconciled?) but is no longer the divergence trigger.
 
 **FR-WD-13: Route List View**
 The dashboard provides a list of all routes belonging to the operator, with name, route number, direction, stop count, last-modified timestamp, and **audio render status**. Routes can be filtered or searched by name. Soft-deleted routes are hidden from this view.
@@ -266,7 +288,7 @@ The dashboard shows a list of all devices registered to the operator, displaying
 After a device is paired, the dashboard allows the fleet manager to assign a human-readable name. Default name on first pair is "New Device" with a sequence number. The device name is operator-only metadata; the tablet itself does not display it.
 
 **FR-WD-17: Device Deactivation**
-The dashboard provides a "Deactivate device" action that sets the device's status to `inactive` in Supabase, revoking its JWT on next refresh attempt. A deactivated device must re-pair to function again. This is used when a tablet is lost, stolen, or decommissioned, and is reflected in billing (deactivated devices do not count toward the monthly billable count).
+The dashboard provides a "Deactivate device" action that sets the device's `activation_state` to `inactive` in Supabase (column renamed from `status` in v3.8 item 3 — see Data Architecture §2.2), revoking its JWT on next refresh attempt. A deactivated device must re-pair to function again. This is used when a tablet is lost, stolen, or decommissioned, and is reflected in billing (deactivated devices do not count toward the monthly billable count). Automatic deactivation also occurs after 60 days without a heartbeat — see §1.4 and Data Architecture §10.
 
 ### 3.4 Dashboard Hosting and Infrastructure
 
@@ -336,10 +358,42 @@ On submission of the pairing code, the app calls a Supabase Edge Function (`pair
 The device JWT is stored in EncryptedSharedPreferences. The accompanying refresh token is stored alongside. The device's pairing details (operator ID, device ID, Android ID) are stored in regular SharedPreferences for diagnostic purposes.
 
 **FR-AT-04: JWT Refresh and Recovery**
-The Supabase client library refreshes the JWT automatically when it approaches expiry. If the refresh token has itself expired (e.g., the device sat unused for many months), the app does NOT prompt the user to re-pair. Instead, the app silently calls the `recover-device` Edge Function, passing both the stored Android ID and the stored device secret. The Android ID identifies the device row; the device secret authenticates the request (the server hashes the presented secret and compares against the stored `device_secret_hash`). On success, a fresh JWT is returned and the device continues without re-pairing. The device secret is stable — it does not change across token recoveries. This means that once a device is paired, it stays paired until explicitly deactivated from the dashboard. If `recover-device` fails (device deactivated, secret mismatch, row missing), the app shows a clear message and returns to the first-run setup screen for re-pairing.
+The Supabase client library refreshes the JWT automatically when it approaches expiry. If the refresh token has itself expired (e.g., the device sat unused for many months), the app does NOT prompt the user to re-pair. Instead, the app silently calls the `recover-device` Edge Function, passing both the stored Android ID and the stored device secret. The Android ID identifies the device row; the device secret authenticates the request (the server hashes the presented secret and compares against the stored `device_secret_hash`). On success, a fresh JWT is returned and the device continues without re-pairing. The device secret is stable — it does not change across token recoveries. This means that once a device is paired, it stays paired until explicitly deactivated from the dashboard.
+
+**Recovery failure handling — transient vs terminal.** `recover-device` failures are classified into two categories with materially different responses. This split is operationally critical: the previous unconditional "drop to pairing screen" behaviour catastrophically punished any transient network blip on an in-service tablet.
+
+**Terminal failures (drop to first-run pairing screen):**
+- HTTP 404 — `devices` row missing (the device was hard-deleted from Supabase).
+- HTTP 401 with body indicating secret mismatch.
+- HTTP response indicating `devices.activation_state = 'inactive'` or the operator is disabled (`pending` / `suspended`).
+
+In these cases, the cached JWT, refresh token, and device secret are wiped from EncryptedSharedPreferences and the app returns to the first-run setup screen. The driver must obtain a new pairing code from the fleet manager.
+
+**Transient failures (retain cached credentials, retry silently):**
+- HTTP 5xx from Supabase (server error, outage).
+- Network errors (DNS failure, connection timeout, connection reset, TLS handshake failure).
+- HTTP 429 (rate-limit, including shared-IP collisions with other tablets).
+- Any error class not in the terminal list above.
+
+In these cases, the cached JWT, refresh token, and device secret are **retained**. The app continues operating with the cached credentials — subsequent sync and heartbeat queries either succeed (the JWT may still be cryptographically valid, just past the soft refresh window) or fail with HTTP 401, in which case the next sync trigger will attempt `recover-device` again. The route list and any in-progress journey continue uninterrupted. A small, non-blocking status indicator on the route-list screen reads *"Pairing refresh failed — will retry"* until a successful `recover-device` clears it. The pairing screen is **not** shown. Only a terminal failure — or an authenticated query rejected with HTTP 401 by Supabase **after** `recover-device` has been attempted — escalates to the pairing screen.
+
+**Rationale.** A bus in service with passengers aboard must not lose its display to a transient Supabase outage, FCM blip, intermittent cellular connection, or shared-IP rate-limit collision. The transient-vs-terminal split keeps a working tablet working through those conditions while still recovering correctly from a genuine deactivation or credential mismatch.
 
 **FR-AT-05: Setup Persistence**
 Once a device is paired, the setup screen is never shown again. The pairing details persist across app restarts and device reboots. The only way to return to the setup screen is via the admin "Deregister Device" action (FR-KM-03), which requires the admin PIN.
+
+**FR-AT-67: Google Mobile Services Availability Check**
+Immediately after a successful pairing (FR-AT-02) and on every subsequent app launch, the app calls `GoogleApiAvailability.getInstance().isGooglePlayServicesAvailable(context)`. If the result is anything other than `ConnectionResult.SUCCESS`, the app displays a clear blocking warning:
+
+> "This tablet does not have Google Mobile Services installed correctly. The Passenger Display System depends on GMS for GPS accuracy and route-sync notifications and will not function reliably without it. Please use a GMS-certified Android tablet."
+
+The warning includes the specific GMS status code (e.g. `SERVICE_MISSING`, `SERVICE_VERSION_UPDATE_REQUIRED`, `SERVICE_DISABLED`) for support diagnostics.
+
+**Block journey start.** While GMS is unavailable, FR-AT-11 (Journey Start) is gated: the "Start Journey" button is disabled with the same warning text on tap. Other functions (route browsing, admin menu, sync) continue to operate so the device can be diagnosed and the user can read the warning.
+
+**Development/testing override.** A clearly-labelled "I understand — continue anyway" button on the warning screen dismisses the block **for the current process lifetime only**. Tapping it logs a `GMS_OVERRIDE_ACKNOWLEDGED` `journey_events` row with the GMS status code in `detail` (see Data Architecture §5.4). The override does not persist across app restarts; the warning re-shows every cold boot until GMS is actually present. This override exists for emulator/CI testing and early-development hardware bring-up; production tablets are expected to be GMS-certified per §11.1 assumption 9.
+
+This FR enforces what §11.1 assumption 9 currently states as policy. Without runtime detection, a non-GMS tablet would boot, fail silently or produce confusing partial behaviour (`FusedLocationProviderClient` returns nothing useful; FCM never registers a token), and the operator would discover the problem only after deploying to a bus.
 
 ### 4.2 Route Browsing (No Creation)
 
@@ -361,7 +415,8 @@ If no routes are available (e.g., the operator hasn't created any yet, or the de
 ### 4.3 Journey Operation
 
 **FR-AT-11: Journey Start**
-The driver selects a route and taps "Start Journey." The app shows a confirmation dialog with route name, stop count, and first/last stop names. On confirmation, the app:
+The driver selects a route and taps "Start Journey." The "Start Journey" button is **disabled** if FR-AT-67's GMS availability check has failed and the user has not acknowledged the override. Otherwise, the app shows a confirmation dialog with route name, stop count, and first/last stop names. On confirmation, the app:
+- Runs the `journey_events` cleanup pass (FR-AT-63) — deletes any rows older than 30 days. Running cleanup at journey start (in addition to app startup) ensures a kiosked tablet that never restarts still receives regular pruning.
 - Initialises the active journey (writes to `journey_state`)
 - Starts the foreground GPS service
 - Takes an initial GPS fix (with accuracy estimate)
@@ -383,9 +438,15 @@ The journey screen is the primary passenger-facing display. Driver controls are 
 **FR-AT-13: Automatic Stop Detection**
 The app continuously monitors GPS position via FusedLocationProviderClient running in a foreground service. On each position fix:
 
-**GPS accuracy gate:** Every fix from FusedLocationProviderClient includes an accuracy estimate (the 68%-confidence radius, in metres). Before running any detection logic, compare this estimate to the current target stop's `proximity_radius_meters` value read from Room. If the fix accuracy is worse than (greater than) that value, discard the fix — no announcement fires and `journey_state` is not advanced. This prevents a bad fix from misfiring in an urban canyon or at journey start.
+**GPS accuracy gate (per-candidate, not per-fix).** Every fix from FusedLocationProviderClient includes an accuracy estimate (the 68%-confidence radius, in metres). The accuracy gate is **evaluated independently for each candidate stop** in the two-stop look-ahead (see below) — the gate is not a single global check on the fix. For each candidate stop, the fix's accuracy estimate is compared to that stop's `proximity_radius_meters`; if accuracy is worse than (greater than) that value, the fix cannot trigger detection for that candidate. A single fix may pass the gate for one candidate and fail it for the other.
 
-**Two-stop look-ahead:** The app monitors proximity to both the next expected stop (N) and the stop immediately after it (N+1), each evaluated against its own `proximity_radius_meters` value.
+**Worked example.** A fix reports accuracy = 50m. Stop N has `proximity_radius_meters = 200` (a motorway-services stop with a generous radius). Stop N+1 has `proximity_radius_meters = 30` (a tight town-centre stop). Outcome:
+- The 50m fix is eligible to trigger stop N detection (50 ≤ 200).
+- The 50m fix is **not** eligible to trigger stop N+1 detection (50 > 30) — it would be discarded for that candidate, even if the bus's reported position is within 30m of stop N+1, because the fix isn't accurate enough to confirm the bus is actually in stop N+1's tight radius.
+
+The same fix is reused for the two evaluations. In practice one fix cannot trigger both candidate stops in the same evaluation cycle, regardless of accuracy — either the bus is in stop N's radius (normal path) or it has overshot into stop N+1's radius (look-ahead path), and the two are mutually exclusive geometrically. The point of per-candidate gating is **correctness**: a coarse fix can still detect a wide-radius stop while being correctly rejected for a tight-radius stop. A single global accuracy gate (e.g. "the current target stop's radius") was ambiguous when the look-ahead is monitoring two stops with different radii.
+
+**Two-stop look-ahead:** The app monitors proximity to both the next expected stop (N) and the stop immediately after it (N+1), each evaluated against its own `proximity_radius_meters` value and its own per-candidate accuracy gate.
 
 - **Normal path — stop N entered:** If the fix passes the accuracy gate for stop N and the bus is within stop N's proximity radius, the app fires the next-stop announcement for N, advances `journey_state.current_stop_index` to N+1, refreshes the visual display, and logs a `STOP_ANNOUNCED` event (trigger = `GPS`).
 - **Look-ahead path — stop N+1 entered without N:** If the fix passes the accuracy gate for stop N+1 and the bus is within stop N+1's proximity radius, but stop N was never registered, the app logs a `STOP_PASSED_WITHOUT_DETECTION` event for N (trigger = `GPS_INFERRED`) and a `STOP_ANNOUNCED` event for N+1 (trigger = `GPS_INFERRED`), announces N+1, advances `current_stop_index` to N+2, and marks stop N as passed (dimmed) on the tube-map view. The driver is not required to take any action.
@@ -414,7 +475,20 @@ When the bus arrives at the final stop, the app plays the termination announceme
 To prevent battery drain if the driver forgets to end a journey, the app automatically terminates the journey and returns to the idle screen if the bus remains stationary at the final stop for 15 minutes (configurable in admin settings).
 
 **FR-AT-18: Journey State Recovery**
-If the app is killed during an active journey (crash, OS kill, unexpected reboot), the journey state is recovered on next launch. The journey_state row indicates the active route and current stop index. The app resumes the journey from this state without driver intervention.
+If the app is killed during an active journey (crash, OS kill, unexpected reboot), the journey state is recovered on next launch — **subject to a staleness check and, if applicable, a diversion-announcement replay**. The naïve "always resume" rule was wrong-by-default in two scenarios: a tablet that sat overnight after the OS killed the app at 2 AM would silently resume yesterday's stale journey at 8 AM the next morning; and a tablet that crashed mid-journey with an active diversion would resume without re-announcing the diversion to passengers who boarded after the crash.
+
+**Constants (defined here and referenced in Data Architecture §5.5):**
+- `JOURNEY_STATE_MAX_AGE_HOURS = 8` — covers a full driving shift. A journey whose `journey_started_at` is more than 8 hours ago is by definition a stale residue from a prior day.
+- `JOURNEY_EVENT_RECENCY_THRESHOLD_HOURS = 1` — a healthy in-service tablet logs `STOP_ANNOUNCED`, `GPS_LOST`, or similar events frequently. A full hour with no `journey_events` activity since `journey_started_at` strongly indicates the bus stopped operating without a clean shutdown.
+
+**Recovery algorithm.** On app launch, if `journey_state.is_active = true`:
+
+1. **Staleness — age.** Compute `journey_age = now() - journey_state.journey_started_at`. If `journey_age > JOURNEY_STATE_MAX_AGE_HOURS`: clear journey state (`is_active = false`, clear `journey_skipped_stops`) and return to the route list. Log a `JOURNEY_AUTO_CLEARED` event with `detail = 'stale_age'`.
+2. **Staleness — event silence.** Look up the most recent `journey_events` row with `timestamp_utc >= journey_state.journey_started_at`. If none exists, or its `timestamp_utc` is older than `now() - JOURNEY_EVENT_RECENCY_THRESHOLD_HOURS`: clear journey state as above with `detail = 'stale_no_events'`.
+3. **Diversion replay (if resuming).** If the state passed both staleness checks and `journey_skipped_stops` is non-empty, replay the diversion start announcement (FR-AT-25) — alert chime → visual flash (FR-AT-65) → `diversion_start.mp3` → tube-map strikethrough rendering — *before* re-arming the GPS state machine. This ensures passengers who boarded during or after the crash hear and see the active diversion context. The replay does **not** insert into `journey_skipped_stops` (it is already populated) and does **not** log a new `DIVERSION_STARTED` event; it logs a `DIVERSION_REPLAYED` event with `detail = 'recovery'` for diagnostic clarity.
+4. **Resume.** Re-arm the foreground GPS service and the two-stop look-ahead state machine from the recorded `current_stop_index`. Skip behaviour (FR-AT-13 diversion-skip handling) proceeds as usual since `journey_skipped_stops` is intact.
+
+The two staleness constants and the algorithm are also documented in Data Architecture §5.5 alongside the `journey_state` schema; the FR is the authoritative behavioural spec.
 
 ### 4.4 Stylised Route Progress View
 
@@ -491,6 +565,8 @@ There are two categories of audio file:
 All files are rendered using a single consistent server-side voice at route-save time (FR-WD-20), ensuring that every tablet in the fleet produces identical audio for any given announcement regardless of tablet model or manufacturer.
 
 **Journey-start gating:** Before enabling the "Start Journey" button for a route, the app verifies that all expected audio files for that route are present in local storage. If any are missing (route newly synced, server-side rendering still in progress, or interrupted download), the route is shown with an "Audio not ready — syncing" indicator and cannot be started. This is a clear error state; there is no fallback to on-device TTS.
+
+**Display-only tablets (`audio_enabled = false`) skip audio download.** A tablet whose `devices.audio_enabled` is `false` does not download route audio at all (Data Architecture §7.2 step 7 `audio_enabled` guard) and does not need the journey-start audio gate — the gate only applies to audio-enabled tablets. Display-only tablets sync route data normally and start journeys based on route presence alone. If the operator later toggles `audio_enabled` from `false` to `true` for that device, the next sync detects the flip and back-fills audio for every current route (Data Architecture §7.2 step 8 flip-detection); the journey-start gate then applies normally from that point onward.
 
 **FR-AT-29: Audio Output Routing**
 Audio is routed to the connected Bluetooth speaker or wired audio output. If no external device is connected, audio plays through the tablet's built-in speaker. Audio focus is requested via AudioFocusRequest with AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK.
@@ -597,7 +673,7 @@ The admin menu, accessed via PIN, includes:
 - Deregister device
 
 **FR-AT-50: Deregister Device**
-The "Deregister device" admin action wipes all local route data, removes the device JWT, and returns the app to the first-run setup screen. The corresponding `devices` row in Supabase is set to `inactive`. This is the only way to re-pair a device with a different operator account.
+The "Deregister device" admin action wipes all local route data, removes the device JWT, and returns the app to the first-run setup screen. The corresponding `devices` row in Supabase has `activation_state` set to `'inactive'`. This is the only way to re-pair a device with a different operator account.
 
 **FR-AT-51: Battery Optimisation Bypass**
 The app requests `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` to prevent Android's battery management from killing the foreground GPS service.
@@ -614,7 +690,7 @@ App updates are delivered by sideloading APK files. The system administrator bui
 ### 4.9 Sync and Offline Operation
 
 **FR-AT-55: Offline-First Operation**
-The app operates fully offline during journeys. All route data and stop data are read from the local Room database. Network connectivity is required only for initial pairing, periodic sync of route changes, and JWT refresh.
+The app operates fully offline during journeys. All route data and stop data are read from the local Room database. Network connectivity is required only for initial pairing, periodic sync of route changes, and JWT refresh. Display-only tablets (`audio_enabled = false`) sync route data normally but skip audio downloads entirely — see FR-AT-28 and Data Architecture §7.2.
 
 **FR-AT-56: Sync Triggers**
 Route sync is initiated by three core triggers:
@@ -670,7 +746,7 @@ The app silently logs key events to the local Room database for diagnostic purpo
 - Significant clock drift events (when sync detects local clock differs from server by >5 minutes)
 - App errors
 
-Logs are stored locally only (not synced). They are accessible via the admin menu for troubleshooting. Logs older than 30 days are auto-deleted on app startup.
+Logs are stored locally only (not synced). They are accessible via the admin menu for troubleshooting. Logs older than 30 days are auto-deleted on app startup **and at every journey start** (FR-AT-11). The journey-start trigger ensures a kiosked tablet — which may never restart for weeks — still receives regular cleanup; the two triggers together bound the pruning latency to a single journey for any in-service tablet.
 
 **FR-AT-64: Heartbeat Mechanism**
 The app sends a lightweight heartbeat to Supabase every 2 minutes whenever it has connectivity. The heartbeat performs a single operation: updating `devices.last_seen_at` to the current timestamp. It is independent of route sync and runs whenever the app is foregrounded (whether or not a journey is active) and best-effort when the app is backgrounded.
@@ -1031,7 +1107,7 @@ The detailed clause-by-clause mapping is provided in the Compliance Mapping Matr
 6. Dashboard users have basic web literacy.
 7. Drivers have basic familiarity with touchscreen devices.
 8. The tablet is connected to vehicle power during operation, not running on battery.
-9. Tablets are Google Mobile Services (GMS) certified to ensure FusedLocationProviderClient and FCM function correctly.
+9. Tablets are Google Mobile Services (GMS) certified to ensure FusedLocationProviderClient and FCM function correctly. (Enforced at runtime by FR-AT-67 — non-GMS tablets are detected and blocked from journey starts.)
 10. Tablets ideally feature a "battery protect" mode (cap charge at 80%) or use cycling chargers, to prevent battery swelling from continuous 100% charging combined with screen wakelocks.
 
 ### 11.2 Dependencies
