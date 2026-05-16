@@ -7,7 +7,21 @@
 
 ## Changelog
 
-### v3.8 (May 2026)
+### v3.8 (May 2026 — item 2 of 4)
+Round-2 post-adversarial-review re-planning pass, item 2 of 4 (bug fixes and operational hardening: heartbeat lifecycle redesign, mid-journey suspension grace, journey-summary upload, Sentry telemetry).
+- §2.6 (new): `journey_summaries` Supabase table — per-journey count metrics (no PII, no location traces). RLS scoped by `operator_id`.
+- §2.7 → §2.8 renumbered: previous §2.6 `naptan_stations` becomes §2.7; previous §2.7 Storage becomes §2.8.
+- §5.8 (new): `journey_summaries_pending` Room table for queued journey summaries awaiting upload. The `needs_upload` flag here is the **only** legitimate use of upload-sync metadata in the initial release; this is a deliberate, scoped exception to the v3.6 removal of the broader upload-sync scaffolding (which targeted `routes` and per-stop metadata, not journey-summary entities).
+- §7.4 Sync Sequence: Operator-status check no longer locks the UI when `journey_state.is_active = true`. The captured status is recorded in `sync_metadata` and acted on at journey end. Mid-journey suspension is honoured at journey end, not mid-journey.
+- §7.7 Heartbeat Mechanism: Rewritten. Heartbeat ownership moves from the foreground GPS service to an application-level lifecycle observer (Hilt-injected singleton observing `ProcessLifecycleOwner`). Closes the "foregrounded but no active journey" third-state gap. The foreground GPS service is no longer the heartbeat owner — it exists for stop detection during journeys only.
+- §7.8 (new): Journey-summary upload at journey end — before clearing `journey_state`, the tablet writes a row to `journey_summaries_pending`; a small upload step (during the next sync) inserts into Supabase `journey_summaries` and clears `needs_upload`.
+- §8.5: Heartbeat flow diagram updated for the new lifecycle-observer ownership.
+- §9: Entity Relationship Summary updated — `journey_summaries` added to Supabase tables list; `journey_summaries_pending` added to Room tables list.
+- §10: Data retention table — added `journey_summaries` (indefinite in Supabase, operator-visible) and `journey_summaries_pending` (cleared on successful upload).
+- §11.2 (new): Third-Party Service Dependencies subsection — Sentry (sentry.io) added as the crash-reporting / error-tracking SDK across Android, dashboard, and Edge Functions. DSN per project, one-off operational setup at Stage 2/3 start.
+- §12: Added `SENTRY_DSN_ANDROID`, `SENTRY_DSN_DASHBOARD`, `SENTRY_DSN_EDGE` environment variables (three separate DSNs, one per project).
+
+### v3.8 (May 2026 — item 1 of 4)
 Round-2 post-adversarial-review re-planning pass, item 1 of 4 (audio pipeline overhaul: pg_boss job queue, Google TTS lock-in, version-keyed Storage paths, render-then-FCM, content-hash differential re-render, render-status surface).
 - §2.4: Added `audio_render_status` (`pending`/`ok`/`failed`), `audio_render_error`, and `audio_announcement_hash` columns to the routes table.
 - §2.5: Added `audio_content_hash` column to route_stops for differential re-rendering.
@@ -193,7 +207,7 @@ Route definitions. Each route belongs to one operator. Routes are authored exclu
 | direction | TEXT | NULLABLE | Direction label: "Outbound", "Return", or custom |
 | return_route_id | UUID | FK → routes(id) DEFERRABLE INITIALLY DEFERRED, NULLABLE | Links to the return route. Deferrable so an outbound + return pair can be inserted in a single transaction. |
 | last_synced_with_return | TIMESTAMPTZ | NULLABLE, DEFAULT NULL | Timestamp set on both routes when a return route is generated (FR-WD-12). Used by the dashboard to detect divergence: if `updated_at > last_synced_with_return` and `return_route_id IS NOT NULL`, the dashboard warns the operator that the linked return route may now be divergent and offers to regenerate it. NULL if no return has ever been generated for this route. |
-| updated_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | Server-assigned via trigger on every INSERT or UPDATE. Used as the sync cursor and as the `route_version` segment of the Storage path scheme (§2.7), expressed as epoch milliseconds. |
+| updated_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | Server-assigned via trigger on every INSERT or UPDATE. Used as the sync cursor and as the `route_version` segment of the Storage path scheme (§2.8), expressed as epoch milliseconds. |
 | is_deleted | BOOLEAN | NOT NULL, DEFAULT false | Soft delete flag. Deleted routes remain for sync propagation. |
 | audio_render_status | TEXT | NOT NULL, DEFAULT 'pending', CHECK (audio_render_status IN ('pending', 'ok', 'failed')) | Current state of the audio render job for this route version. `pending` immediately after `replace_route_with_stops`. Flipped to `ok` by the audio render worker on successful completion (§4.6); flipped to `failed` after the worker exhausts its retries. The dashboard surfaces this status in the route list (PRD FR-WD-13); the tablet uses it to skip audio download for failed routes (§7.4). |
 | audio_render_error | TEXT | NULLABLE | Last error message captured when `audio_render_status = 'failed'`. NULL when status is `pending` or `ok`. Cleared back to NULL by the worker on a successful re-render. Surfaced on the dashboard for diagnostic purposes. |
@@ -224,7 +238,36 @@ Ordered list of stops within a route. Stops are always synced as a complete set 
 
 **No updated_at or is_deleted:** Stops do not have their own sync timestamps or soft-delete flags. When a route is synced, its entire stop list is replaced atomically by the `replace_route_with_stops` RPC.
 
-### 2.6 naptan_stations
+### 2.6 journey_summaries
+
+One row per completed journey. Holds anonymous count metrics derived from the tablet's local `journey_events` log. No PII, no location traces — only counts. Uploaded by the tablet at journey end (see §7.8); the tablet first writes to its local `journey_summaries_pending` table (§5.8) and uploads on next sync.
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| id | UUID | PK, DEFAULT gen_random_uuid() | Unique summary identifier |
+| device_id | UUID | NOT NULL, FK → devices(id) | The device that ran the journey |
+| operator_id | UUID | NOT NULL, FK → operators(id) | Owning operator (RLS scope) |
+| route_id | UUID | NULLABLE, FK → routes(id) ON DELETE SET NULL | The route that was run. Nullable so summaries survive a future hard-delete of the route (see §10 data retention) |
+| journey_started_at | TIMESTAMPTZ | NOT NULL | Wall-clock journey start (from local `journey_state.journey_started_at`) |
+| journey_ended_at | TIMESTAMPTZ | NOT NULL | Wall-clock journey end |
+| stops_announced_count | INTEGER | NOT NULL, DEFAULT 0 | Count of `STOP_ANNOUNCED` events during the journey |
+| stops_passed_without_detection_count | INTEGER | NOT NULL, DEFAULT 0 | Count of `STOP_PASSED_WITHOUT_DETECTION` events. A proxy for GPS reliability |
+| manual_advances_count | INTEGER | NOT NULL, DEFAULT 0 | Count of `STOP_ANNOUNCED` events with `trigger_method = 'MANUAL'`. A second GPS-reliability proxy |
+| gps_lost_events_count | INTEGER | NOT NULL, DEFAULT 0 | Count of `GPS_LOST` events during the journey |
+| audio_failures_count | INTEGER | NOT NULL, DEFAULT 0 | Count of `AUDIO_FILE_MISSING` + `AUDIO_PLAYBACK_ERROR` events |
+| diversion_invoked | BOOLEAN | NOT NULL, DEFAULT false | True if `journey_skipped_stops` was non-empty at any point during the journey |
+| created_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | Server-side insert timestamp |
+
+**Indexes:** `(operator_id, device_id, journey_started_at DESC)` for the per-device drill-down (PRD FR-WD-23); `(operator_id, journey_started_at DESC)` for any future operator-wide rollups.
+
+**RLS:**
+- SELECT: dashboard users where `operator_id = (auth.jwt()->>'operator_id')::uuid`. Device tokens do **not** read this table — devices only write their own rows.
+- INSERT: device users where `device_id = (auth.jwt()->>'device_id')::uuid` AND `operator_id = (auth.jwt()->>'operator_id')::uuid`. Constrains a device to inserting only its own summaries under its own operator.
+- UPDATE, DELETE: not allowed via policy. The system administrator can act via service role.
+
+**Privacy posture:** This is the only table in the system that summarises per-journey activity. It contains no operator names, no driver names, no passenger information, and no GPS traces. It is deliberately reduced to counts so that the operational benefit (fleet-health drill-down via PRD FR-WD-23) can be obtained without privacy concerns.
+
+### 2.7 naptan_stations
 
 Reference data: all UK NaPTAN entries (railway stations and bus stops). Approximately 400,000 rows. Shared across all operators (not multi-tenant).
 
@@ -245,7 +288,7 @@ Reference data: all UK NaPTAN entries (railway stations and bus stops). Approxim
 
 **Data loading:** NaPTAN data is imported via SQL editor or `psql` from the Department for Transport's published NaPTAN CSV. The import process is documented in a separate operations runbook; in summary: download the CSV, transform with a one-off script to extract relevant columns and assign `stop_type`, COPY into the table. Re-imports replace existing rows by `naptan_id` UPSERT.
 
-### 2.7 Supabase Storage — Route Audio Files
+### 2.8 Supabase Storage — Route Audio Files
 
 Pre-rendered audio files for route-specific announcements are stored in Supabase Storage. Fixed
 announcement texts that do not vary by route (termination, hail-and-ride start/end, diversion
@@ -805,7 +848,7 @@ Local mirror of the operator's routes from Supabase.
 | route_number | TEXT | NULLABLE | Optional route number |
 | direction | TEXT | NULLABLE | Direction label |
 | return_route_id | TEXT | NULLABLE | Links to return route |
-| updated_at_utc | LONG | NOT NULL | Epoch millis of server timestamp. Also used as the `route_version` path segment for audio downloads (§7.2 step 7, §2.7). |
+| updated_at_utc | LONG | NOT NULL | Epoch millis of server timestamp. Also used as the `route_version` path segment for audio downloads (§7.2 step 7, §2.8). |
 | is_deleted | BOOLEAN | NOT NULL | Soft delete flag from Supabase. When true, hidden from route list. |
 | audio_render_status | TEXT | NOT NULL, DEFAULT 'pending' | Mirror of `routes.audio_render_status` from Supabase (`pending` / `ok` / `failed`). Read by the audio-download step (§7.4) — only `ok` routes attempt to download audio. Read by the journey-start gate (§6.4) which requires `ok` AND all files present locally. |
 | pending_deletion | BOOLEAN | NOT NULL, DEFAULT false | Local-only: true if sync pulled a remotely deleted route that is currently active in a journey. Route stays usable for that journey but hidden from the route list. Cleanup sets is_deleted = true when the journey ends. |
@@ -871,6 +914,7 @@ Tracks sync state. Single-row table.
 | last_sync_at | LONG | NULLABLE | Epoch millis of last successful sync completion |
 | sync_status | TEXT | NOT NULL, DEFAULT 'never' | 'synced', 'syncing', 'failed', 'never' |
 | last_server_timestamp | LONG | NOT NULL, DEFAULT 0 | Server transaction timestamp from the last successful download. Used as the sync cursor for `get_routes_since`. |
+| pending_account_status | TEXT | NULLABLE, DEFAULT NULL | Captured operator account status when a sync occurs during an active journey (`journey_state.is_active = true`). Values: NULL (nothing captured / operator is active), `'pending'`, or `'suspended'`. Read at journey end (§7.8) to decide whether to route to the Account Status Screen (FR-AT-60). Cleared when a subsequent sync sees `status = 'active'`. See §7.4 "Mid-journey suspension grace." |
 
 ### 5.7 journey_skipped_stops (Local Only)
 
@@ -883,9 +927,30 @@ Transient list of stop indices skipped due to an active driver-initiated diversi
 
 **Implementation note:** When `journey_state.current_stop_index` advances to a value present in this table, the GPS state machine immediately increments the index again (repeatedly, until reaching a non-skipped index) without waiting for GPS proximity and without firing any announcement. A `STOP_SKIPPED` event is logged for each skipped stop. This table is emptied (`DELETE FROM journey_skipped_stops`) at journey start and on "Diversion end." Since there is only ever one active journey at a time, no journey ID foreign key is required.
 
----
+### 5.8 journey_summaries_pending (Local Only)
 
-## 6. Non-Database Storage
+Holds journey-summary rows queued for upload to Supabase `journey_summaries` (§2.6). Written at journey end (§7.8); rows are deleted after a successful upload. Unsynced rows survive app restarts and reboots.
+
+| Column | Type | Constraints | Description |
+|---|---|---|---|
+| id | TEXT | PK | Locally-generated UUID. Used as the eventual Supabase `journey_summaries.id` so retries are idempotent. |
+| device_id | TEXT | NOT NULL | This device's UUID (matches Supabase) |
+| operator_id | TEXT | NOT NULL | Owning operator UUID |
+| route_id | TEXT | NULLABLE | The route that was run. May be NULL if the route was locally removed before the summary was written |
+| journey_started_at | LONG | NOT NULL | Epoch millis |
+| journey_ended_at | LONG | NOT NULL | Epoch millis |
+| stops_announced_count | INTEGER | NOT NULL, DEFAULT 0 | Count of STOP_ANNOUNCED events |
+| stops_passed_without_detection_count | INTEGER | NOT NULL, DEFAULT 0 | Count of STOP_PASSED_WITHOUT_DETECTION events |
+| manual_advances_count | INTEGER | NOT NULL, DEFAULT 0 | Count of STOP_ANNOUNCED with trigger_method = 'MANUAL' |
+| gps_lost_events_count | INTEGER | NOT NULL, DEFAULT 0 | Count of GPS_LOST events |
+| audio_failures_count | INTEGER | NOT NULL, DEFAULT 0 | Count of AUDIO_FILE_MISSING + AUDIO_PLAYBACK_ERROR events |
+| diversion_invoked | INTEGER | NOT NULL, DEFAULT 0 | 0/1 (SQLite has no native BOOLEAN). True if journey_skipped_stops was non-empty at any point |
+| needs_upload | INTEGER | NOT NULL, DEFAULT 1 | 0/1. True until the row has been successfully inserted into Supabase `journey_summaries`. After a successful upload, the row is deleted from this table rather than flipped — `needs_upload` exists as a state flag for the upload step to retry on, and to make resumable upload observable in diagnostic queries. |
+| last_upload_attempt_at | LONG | NULLABLE | Epoch millis of last upload attempt, if any. Diagnostic only. |
+
+**Index:** `needs_upload` (for the upload step's lookup of pending rows).
+
+**Single legitimate use of upload-sync metadata.** The v3.6 changelog removed `needs_upload` placeholders from `routes` (§5.1) and removed the upload-sync algorithm wholesale from §7. That removal targeted a speculative future *route-upload* path that the initial release does not need; routes remain read-only on the tablet. The `journey_summaries_pending` table is a deliberate, scoped exception — it exists for one specific, narrow purpose (uploading anonymous per-journey count metrics at journey end), and `needs_upload` here is **not** a return of generic upload-sync scaffolding. Any future feature wanting per-entity upload metadata should make its case on its own merits; the v3.6 removal still stands for everything else.
 
 ### 6.1 EncryptedSharedPreferences (Secure Local Storage)
 
@@ -948,7 +1013,7 @@ audio/
         stop_N.mp3
 ```
 
-`{route_version}` matches the version segment in the Storage path scheme (§2.7) and is the
+`{route_version}` matches the version segment in the Storage path scheme (§2.8) and is the
 route's `updated_at` in epoch millis. The tablet holds exactly one version per route at any
 given time — when a new version is downloaded successfully, the previous version's
 directory is removed.
@@ -1003,7 +1068,7 @@ Note: the heartbeat (§7.7) is a separate mechanism from route sync. It updates 
 4. For each non-deleted returned route, replace its stops in Room: delete all local route_stops for that route_id, then insert the complete set from the RPC response. This is safe because no local tables have foreign key references to route_stop IDs.
 5. Update `sync_metadata.last_server_timestamp` to the `server_now` returned by the RPC.
 6. Update `sync_metadata.last_sync_at` and set `sync_status = 'synced'`.
-7. **Download audio files (version-keyed):** For each route UPSERT'd in step 3 (not deleted), download audio files from Supabase Storage to local file storage (§6.4) using the route's version-keyed path scheme (§2.7):
+7. **Download audio files (version-keyed):** For each route UPSERT'd in step 3 (not deleted), download audio files from Supabase Storage to local file storage (§6.4) using the route's version-keyed path scheme (§2.8):
    - **Render-status guard.** If the route's `audio_render_status = 'failed'`, do **not** attempt any audio download for it — the version-keyed path will not exist in Storage and the request would 404. Log `AUDIO_FILE_MISSING` once with `detail = 'render_failed'` and move on. The "Audio not ready" indicator (§6.4) continues to gate journey starts. If `audio_render_status = 'pending'`, also defer download — a future sync (after the render worker completes) will see `ok`.
    - **For routes with `audio_render_status = 'ok'`:** compute `route_version` as the route's `updated_at` in epoch millis. The expected file list is `route_announcement.mp3` plus `stop_{N}.mp3` for each stop, all under `{operator_id}/{route_id}/{route_version}/`.
    - If the route was updated in this sync (it appears in the `get_routes_since` response), the path's `route_version` segment has changed; download all audio files for the new version into a fresh local `{route_id}/{route_version}/` directory (see §6.4 layout note). The previous local version directory is removed once the new download completes successfully.
@@ -1015,14 +1080,22 @@ Note: the heartbeat (§7.7) is a separate mechanism from route sync. It updates 
 ### 7.4 Sync Algorithm — Full Sequence
 
 1. Set `sync_metadata.sync_status = 'syncing'`.
-2. Check operator account status by querying the `operators` row. Abort sync if `status != 'active'`:
-   - `status = 'pending'`: display "Account pending approval — contact your administrator" and abort.
-   - `status = 'suspended'`: display "Account Suspended — please contact your bus company administrator" and abort.
+2. Check operator account status by querying the `operators` row. Read `journey_state.is_active` from local Room.
+   - **If `journey_state.is_active = true`:** record the returned status in `sync_metadata.pending_account_status` (a new local column, see note below) and **continue sync normally**. The UI is **not** locked, regardless of whether the status is `pending`, `active`, or `suspended`. Acting on a non-active status mid-journey would tear down the passenger display on a bus carrying passengers in service. The captured status is honoured at journey end (see §7.8 and PRD FR-AT-60).
+   - **If `journey_state.is_active = false`:** apply the status check as a hard gate:
+     - `status = 'pending'`: display "Account pending approval — contact your administrator" and abort.
+     - `status = 'suspended'`: display "Account Suspended — please contact your bus company administrator" and abort.
+     - `status = 'active'`: clear any previously captured `pending_account_status` and continue.
 3. **Download** remote route and stop changes per section 7.2 steps 1–6. The route rows pulled by `get_routes_since` carry the new `audio_render_status` and `audio_render_error` columns (§2.4); these are written into the local Room `routes` mirror (§5.1) and used by the audio-download step below.
 4. **Download audio files** per section 7.2 step 7, using version-keyed paths derived from each route's `updated_at` and skipping any route whose `audio_render_status` is `failed` or `pending`. Audio download runs after route data is committed to Room. Audio failures do not fail the sync — routes are updated even if audio files are temporarily unavailable.
-5. Set `sync_metadata.sync_status = 'synced'`.
-6. Update `devices.active_route_id` if a journey is in progress.
-7. On any failure in steps 1–3 or 5, set `sync_status = 'failed'` and retry on next trigger. Audio download failure (step 4) is logged but does not set `sync_status = 'failed'`.
+5. **Upload pending journey summaries** per §7.8. Failures here are non-fatal — rows remain in `journey_summaries_pending` for the next sync.
+6. Set `sync_metadata.sync_status = 'synced'`.
+7. Update `devices.active_route_id` if a journey is in progress.
+8. On any failure in steps 1–3 or 6, set `sync_status = 'failed'` and retry on next trigger. Audio download failure (step 4) and journey-summary upload failure (step 5) are logged but do not set `sync_status = 'failed'`.
+
+**Mid-journey suspension grace.** Mid-journey suspension is honoured at journey end, not mid-journey. The cost — one final journey of "unpaid" service after suspension — is acceptable and recoverable via invoicing. The humane-and-operationally-correct behaviour is to never tear down a passenger display while passengers are aboard.
+
+**Note on `sync_metadata.pending_account_status`.** This column is added to §5.6 implicitly as a single nullable TEXT field on the single-row `sync_metadata` table. Values: NULL (no pending non-active status captured), `'pending'`, or `'suspended'`. Cleared when a subsequent sync sees `status = 'active'` (step 2 above) or when the Account Status Screen is dismissed after a return to active (FR-AT-60). The journey-end transition (§7.8) reads this column to decide whether to route to the route list or to the Account Status Screen.
 
 ### 7.5 Conflict Resolution
 
@@ -1062,27 +1135,69 @@ eventual consistency — propagation may take up to 30 minutes in the worst case
 
 ### 7.7 Heartbeat Mechanism
 
-The heartbeat is a lightweight periodic update that keeps `devices.last_seen_at` current whenever the tablet has connectivity. It is independent of route sync: it does not fetch routes, process changes, or update any other state. It runs even when there is nothing to sync and during active journeys.
+The heartbeat is a lightweight periodic update that keeps `devices.last_seen_at` current whenever the tablet has connectivity. It is independent of route sync: it does not fetch routes, process changes, or update any other state. It runs whenever the app is in the foreground (whether or not a journey is active) and best-effort when the app is backgrounded.
 
-**Purpose:** The dashboard's fleet view uses `last_seen_at` to show online/offline status. Without a heartbeat, `last_seen_at` only updates when a route sync occurs (every 30 minutes at most), causing healthy in-service tablets to appear offline. The heartbeat ensures `last_seen_at` is accurate throughout the device's operating day.
+**Purpose.** The dashboard's fleet view uses `last_seen_at` to show online/offline status. Without a heartbeat, `last_seen_at` only updates when a route sync occurs (every 30 minutes at most), causing healthy in-service tablets to appear offline. The heartbeat ensures `last_seen_at` is accurate throughout the device's operating day — including when the driver has the tablet on but no journey is active (e.g., browsing the route list, viewing route detail, working in the admin menu). This "foregrounded-but-idle" state was previously uncovered by the heartbeat and is the case this redesign addresses.
 
-**Interval:** 2 minutes.
+**Interval.** 2 minutes.
 
-**Online threshold:** A device is considered online if `last_seen_at` is within the last 5 minutes. The 2-minute heartbeat interval plus a 3-minute margin for network hiccups gives a 5-minute threshold that a healthy tablet reliably meets.
+**Online threshold.** A device is considered online if `last_seen_at` is within the last 5 minutes. The 2-minute heartbeat interval plus a 3-minute margin for network hiccups gives a 5-minute threshold that a healthy tablet reliably meets.
+
+**Ownership.** Heartbeats are owned by an **application-level lifecycle observer** — a Hilt-injected singleton (e.g., `HeartbeatController`) that observes `ProcessLifecycleOwner.get().lifecycle`. The foreground GPS service is **not** the heartbeat owner. The GPS service exists for stop detection during journeys; the heartbeat lives at a higher level so that its lifecycle is tied to the app being foregrounded, not to whether a journey is in progress. Decoupling these two responsibilities closes the previous third-state gap (foregrounded but no journey active) and makes each component single-purpose.
 
 **Implementation — two-path:**
 
-1. **During active journeys (foreground GPS service):** A `Handler.postDelayed` loop with a 2-minute interval runs inside the foreground GPS service. Because the GPS service is a foreground service (with persistent notification), it is protected from OEM battery optimisation kills that routinely throttle WorkManager on cheap Android hardware. This is the critical path: it ensures fleet status is accurate during the exact window a bus is in service.
+1. **App-foregrounded path (reliable).** A `Handler`-based ticker tied to `ProcessLifecycleOwner.get().lifecycle`:
+   - On `ON_RESUME` (any Activity reaches the `RESUMED` state), `HeartbeatController` starts a `Handler.postDelayed` loop with a 2-minute interval. The first tick fires immediately so the app announces "I'm here" on resume.
+   - On `ON_PAUSE` (the last `RESUMED` Activity leaves `RESUMED`), the ticker is cancelled.
+   - This path covers every state in which the driver is actively using the app: route list, route detail, admin menu, active journey, settings, etc. Because the app is foregrounded, the OS does not throttle this loop — it is as reliable as the app itself is.
 
-2. **When idle / backgrounded (WorkManager):** A `PeriodicWorkRequest` with a 2-minute interval handles heartbeats when no journey is active and the GPS service is not running. WorkManager may be delayed by OEM scheduling on aggressive devices, but the consequence during idle periods (slightly stale `last_seen_at`) is acceptable.
+2. **Background/idle path (best-effort).** A WorkManager `PeriodicWorkRequest` with a 2-minute interval runs only when the app is backgrounded or the screen is off:
+   - The controller observes `ON_STOP` and schedules the periodic work; on `ON_START` it cancels the periodic work (the foreground ticker has resumed).
+   - WorkManager may be delayed or throttled by OEM scheduling on aggressive hardware. This is the OEM best-effort caveat that has always applied to the idle path.
 
-**Database operation:** A single `UPDATE devices SET last_seen_at = now() WHERE id = :device_id` query using the device's existing Supabase session. No payload, no route data.
+**Database operation.** A single `UPDATE devices SET last_seen_at = now() WHERE id = :device_id` query using the device's existing Supabase session. No payload, no route data.
 
-**Failure handling:** Heartbeat failures are silent. No UI indication, no retry. The next successful heartbeat updates the timestamp. A failed heartbeat does not affect journey operation.
+**Failure handling.** Heartbeat failures are silent. No UI indication, no retry. The next successful heartbeat updates the timestamp. A failed heartbeat does not affect journey operation.
 
-**OEM best-effort caveat (idle path):** The WorkManager `PeriodicWorkRequest` used for idle-path heartbeats is best-effort on hostile-OEM cheap tablets — the same OEM category flagged in the PRD risk table for foreground service killing. Aggressive OEM battery management can throttle or delay WorkManager tasks in ways that `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` does not address. As a result: **the journey-path heartbeat (Handler loop inside the foreground GPS service) is reliable and protected**; the **idle-path WorkManager heartbeat is not guaranteed on hostile hardware**. A tablet that is powered off, in aggressive doze mode, or managed by a hostile OEM when idle may show offline in the fleet view until its next boot or until it starts a journey (at which point the protected foreground service takes over). This is acceptable and documented behaviour — the critical online-status window is during active journeys, which the foreground-service path reliably covers. Fleet managers should interpret idle tablets as "not in service" rather than "connectivity failure."
+**OEM best-effort caveat (background/idle path).** The WorkManager `PeriodicWorkRequest` used for the background/idle heartbeat is best-effort on hostile-OEM cheap tablets — the same OEM category flagged in the PRD risk table for foreground service killing. Aggressive OEM battery management can throttle or delay WorkManager tasks in ways that `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` does not address. As a result: **the foregrounded path (Handler ticker on ProcessLifecycleOwner) is reliable**; the **background/idle WorkManager path is not guaranteed on hostile hardware**. A tablet that is powered off, fully backgrounded, in aggressive doze mode, or managed by a hostile OEM may show offline in the fleet view until the app is foregrounded again. This is acceptable and documented behaviour — the critical online-status window is during journeys and immediately around journey start/end, which the foregrounded path reliably covers. Fleet managers should interpret idle (un-foregrounded) tablets as "not in active use" rather than "connectivity failure."
 
-**Relationship to sync:** The heartbeat does not replace or interact with the three sync triggers (§7.1). Sync remains triggered by ConnectivityManager, FCM, and the 30-minute WorkManager periodic task. The heartbeat only updates `last_seen_at`.
+**Relationship to GPS service.** The foreground GPS service is started at journey start and stopped at journey end. Its only job is GPS-based stop detection. It does not own, fire, or supervise the heartbeat. When a journey starts, the heartbeat continues running on its existing foreground-path ticker (the journey-start activity is `RESUMED`); when a journey ends, the ticker continues until the activity is paused or the app is backgrounded.
+
+**Relationship to sync.** The heartbeat does not replace or interact with the three sync triggers (§7.1). Sync remains triggered by ConnectivityManager, FCM, and the 30-minute WorkManager periodic task. The heartbeat only updates `last_seen_at`.
+
+### 7.8 Journey-Summary Upload
+
+At journey end, the tablet writes a single anonymous-count summary row to local Room (§5.8 `journey_summaries_pending`) and uploads queued summaries during sync into the Supabase `journey_summaries` table (§2.6). This is **not a real-time stream and does not violate offline-first** — it's a small post-journey payload sent during the post-journey sync that already happens.
+
+**At journey end (write to local pending table):**
+
+1. Triggered by any journey termination — driver-ended via the End Journey action, journey auto-timeout, or natural arrival at the final stop.
+2. **Before clearing `journey_state`**, build a `journey_summaries_pending` row by aggregating the just-completed journey's `journey_events` rows:
+   - `stops_announced_count = COUNT(*) WHERE event_type = 'STOP_ANNOUNCED'`
+   - `stops_passed_without_detection_count = COUNT(*) WHERE event_type = 'STOP_PASSED_WITHOUT_DETECTION'`
+   - `manual_advances_count = COUNT(*) WHERE event_type = 'STOP_ANNOUNCED' AND trigger_method = 'MANUAL'`
+   - `gps_lost_events_count = COUNT(*) WHERE event_type = 'GPS_LOST'`
+   - `audio_failures_count = COUNT(*) WHERE event_type IN ('AUDIO_FILE_MISSING', 'AUDIO_PLAYBACK_ERROR')`
+   - `diversion_invoked = (SELECT EXISTS (SELECT 1 FROM journey_skipped_stops))` evaluated at journey end. Because `journey_skipped_stops` is cleared at journey start, any row present at journey end indicates a diversion occurred during this journey. (If the diversion was cleared mid-journey via "Diversion end," that already cleared the table; in that case `diversion_invoked` should be tracked via a `journey_state.diversion_invoked_at_any_point` boolean — see implementation note below.)
+3. The row scoping window for `journey_events` aggregation is "events with `timestamp_utc >= journey_state.journey_started_at`" — every event since the journey began, including those logged in the same transaction as the journey-end event.
+4. Insert into `journey_summaries_pending` with `needs_upload = 1`. Generate `id` as a fresh UUID; this is the same UUID that will be used as the Supabase PK on upload, making the upload idempotent on retry.
+5. After the pending row is written, clear `journey_state.is_active = false` (and the rest of journey teardown follows: `journey_skipped_stops` cleared, etc.).
+6. After teardown, the controller reads `sync_metadata.pending_account_status`. If non-NULL (`'pending'` or `'suspended'`), transition the UI to the Account Status Screen (FR-AT-60). Otherwise return to the route list normally.
+
+**Implementation note on `diversion_invoked`.** Because `journey_skipped_stops` is cleared on "Diversion end," a journey that had a diversion that was then ended would lose that signal by journey end. A small boolean on `journey_state` (`diversion_invoked` or similar) is set the first time the table is non-empty and is read at journey end. This is a Room schema implementation detail rather than a separate concept; an alternative is to log a `DIVERSION_STARTED` event (already in the event_type list, §5.4) and aggregate that. Either approach works; the choice is left to the Android implementation.
+
+**Upload step (during sync):**
+
+1. As part of §7.4 step 5 (after the route data has been committed to Room and audio has been downloaded), the tablet queries `SELECT * FROM journey_summaries_pending WHERE needs_upload = 1 ORDER BY journey_started_at ASC`.
+2. For each pending row, perform an INSERT into Supabase `journey_summaries` using the device's authenticated session. The device JWT scopes the insert to its own `(device_id, operator_id)` via RLS (§2.6).
+3. On success (200 / 201), **delete** the row from `journey_summaries_pending`. (Deletion rather than `UPDATE needs_upload = 0` keeps the local table small and avoids accumulating historical local rows.)
+4. On failure (network, RLS rejection, transient 5xx), leave the row in place with `needs_upload = 1` and set `last_upload_attempt_at = now()`. Move on to the next row; do not abort the sync.
+5. Upload failures do not set `sync_status = 'failed'` — journey-summary upload is a non-critical side channel. Pending rows are simply retried on the next sync.
+
+**Offline-first compatibility.** Because `journey_summaries_pending` is local and rows persist across restarts, a tablet can run journeys offline for days and back-fill summaries on next sync. The pending table is a short-lived queue, not a permanent record — once Supabase has the row, the local copy is deleted.
+
+**Privacy.** Summaries contain no operator names, no driver names, no passenger information, no GPS traces, and no stop names. They are pure aggregate counts plus journey start/end timestamps. See §2.6 privacy posture.
 
 ---
 
@@ -1245,22 +1360,40 @@ The heartbeat is a lightweight periodic update that keeps `devices.last_seen_at`
 
 ### 8.5 Heartbeat Flow
 
-    GPS Service (foreground, journey active)        Supabase
-       |                                               |
-       |-- [every 2 minutes, Handler.postDelayed] ---->|
-       |   UPDATE devices SET last_seen_at = now()     |
-       |<-- 200 OK ------------------------------------|
-       |                                               |
-       |   [on failure: log silently, no retry]        |
+    App (foregrounded — any Activity RESUMED)        Supabase
+    HeartbeatController (Hilt singleton,                |
+      ProcessLifecycleOwner observer)                   |
+       |                                                |
+       |-- [on ON_RESUME, immediately] ---------------->|
+       |   UPDATE devices SET last_seen_at = now()      |
+       |<-- 200 OK -------------------------------------|
+       |                                                |
+       |-- [every 2 minutes, Handler.postDelayed] ----->|
+       |   UPDATE devices SET last_seen_at = now()      |
+       |<-- 200 OK -------------------------------------|
+       |                                                |
+       |   [on ON_PAUSE: ticker cancelled,              |
+       |    WorkManager periodic work scheduled]        |
+       |                                                |
+       |   [on failure: log silently, no retry]         |
 
-    WorkManager (idle, no journey active)           Supabase
-       |                                               |
-       |-- [every 2 minutes, PeriodicWorkRequest] ---->|
-       |   UPDATE devices SET last_seen_at = now()     |
-       |<-- 200 OK ------------------------------------|
-       |                                               |
-       |   [on failure: log silently, no retry]        |
-       |   [next scheduled run retries naturally]      |
+    WorkManager (app backgrounded / screen off)      Supabase
+       |                                                |
+       |-- [every 2 minutes, PeriodicWorkRequest] ----->|
+       |   UPDATE devices SET last_seen_at = now()      |
+       |<-- 200 OK -------------------------------------|
+       |                                                |
+       |   [on ON_START: periodic work cancelled,       |
+       |    foreground ticker resumed]                  |
+       |                                                |
+       |   [on failure: log silently, no retry]         |
+       |   [next scheduled run retries naturally]       |
+       |   [OEM best-effort caveat on hostile hardware] |
+
+    Note: the foreground GPS service is NOT involved in the heartbeat.
+    Heartbeat lifecycle is owned by HeartbeatController at the app level,
+    not by the GPS service. Journey activity does not affect heartbeating
+    other than via the app remaining foregrounded during a journey.
 
 ---
 
@@ -1275,8 +1408,10 @@ The heartbeat is a lightweight periodic update that keeps `devices.last_seen_at`
         |                  |                    +-- (1:1) --> auth.users  (each device is also an auth user)
         |                  |
         |                  +-- (1:many) --> routes
-        |                                       |
-        |                                       +-- (1:many) --> route_stops
+        |                  |                    |
+        |                  |                    +-- (1:many) --> route_stops
+        |                  |
+        |                  +-- (1:many) --> journey_summaries   (operator-scoped, anonymous counts)
         |
         +-- (1:1) --> devices                              (alternative path: tablet user)
 
@@ -1284,7 +1419,8 @@ The heartbeat is a lightweight periodic update that keeps `devices.last_seen_at`
     naptan_stations:      standalone reference data, shared across all operators.
 
     Local (Room) tables: routes, route_stops,
-                         journey_events, journey_state, sync_metadata
+                         journey_events, journey_state, sync_metadata,
+                         journey_skipped_stops, journey_summaries_pending
 
 ---
 
@@ -1299,10 +1435,14 @@ The heartbeat is a lightweight periodic update that keeps `devices.last_seen_at`
 | Inactive devices | Indefinite in Supabase | Could be auto-deregistered after extended inactivity (operations decision) |
 | Route audio (Storage) | Two most-recent versions per route | Daily `audio-cleanup-worker` (§4.7) at 03:00 UTC; older `{route_version}` paths removed |
 | pg_boss jobs | 7 days after completion or terminal failure | `retentionDays: 7` on the `render-route-audio` queue (§4.6); pg_boss archives to `pgboss.archive` then prunes |
+| Journey summaries (Supabase) | Indefinite | Operator-visible in the dashboard per-device drill-down (PRD FR-WD-23). No automatic deletion; the system administrator may prune via service role if storage cost ever becomes a concern. No PII to protect. |
+| Journey summaries pending (local) | Until successful upload | Deleted from `journey_summaries_pending` (§5.8) on a successful INSERT into Supabase `journey_summaries`. Rows survive app restarts; the upload step retries on every sync. |
 
 ---
 
 ## 11. Implementation Notes
+
+### 11.1 Cross-Cutting Implementation Notes
 
 A few non-obvious points worth capturing here so they're not lost:
 
@@ -1355,6 +1495,54 @@ versioning across library upgrades.
 usable once audio files are present and `audio_render_status = 'ok'`; the "Audio not ready"
 indicator disappears after the next successful download.
 
+### 11.2 Third-Party Service Dependencies
+
+**Sentry (sentry.io)** — the crash-reporting and error-tracking SDK for all three surfaces:
+the Android tablet app, the Next.js dashboard, and Supabase Edge Functions. Sentry's free
+tier (5,000 errors/month) is expected to be sufficient at projected fleet size; the system
+administrator monitors quota usage and can upgrade if/when needed.
+
+**Project layout.** Three separate Sentry projects, one per surface, each with its own DSN.
+DSN values are delivered via environment variables — see §12. Three projects (rather than
+one shared project) keeps error volumes, release tags, and alerting rules cleanly separated
+by surface.
+
+**Android (tablet).** The Sentry Android SDK is initialised at `Application.onCreate()`. It
+captures:
+- Unhandled exceptions (including those in coroutines and background workers when configured).
+- ANRs (Application Not Responding) on the main thread.
+- Session crash counts for release-health metrics.
+Breadcrumbs include journey-lifecycle events (`route_id`, `current_stop_index`,
+`device_id` — all diagnostic, no PII), GPS state transitions (`GPS_LOST`, `GPS_REGAINED`),
+sync outcomes, and audio events. **No operator names, no passenger information** — the
+system contains no end-user PII at all. `device_id` is included because it is purely a
+diagnostic identifier and is essential for correlating crashes with the affected device in
+the fleet view; it is not personal data.
+
+**Dashboard (Next.js).** The `@sentry/nextjs` SDK is wired in via the standard Next.js
+config. It captures:
+- Client-side React errors (error boundaries and unhandled promise rejections).
+- Server-side rendering errors.
+- Server-action errors (route creation, pairing-code generation, audio re-render action).
+
+**Edge Functions.** The Sentry SDK for Deno (or the relevant runtime) is initialised at the
+top of each Edge Function. Errors are reported for:
+- `pair-device`
+- `recover-device`
+- `generate-pairing-code`
+- `enqueue-render-job`
+- `audio-render-worker`
+- `audio-cleanup-worker`
+- `retry-admin-notification`
+
+**Failure mode.** The Sentry SDK fails open. If Sentry itself is unavailable or
+rate-limited, application behaviour is unaffected — errors that would have been reported
+are dropped silently rather than blocking the request path.
+
+**One-off operational setup.** Sentry account/project creation and DSN provisioning is a
+one-off operational task performed at Stage 2/3 start (when the Android app and dashboard
+exist). It is not a per-deployment or per-release task. See the §12 setup checklist.
+
 ---
 
 ## 12. Environment Variables and Secrets
@@ -1372,6 +1560,9 @@ at invocation time.
 | `GOOGLE_TTS_API_KEY` | `audio-render-worker` | Google Cloud Text-to-Speech API key. Created in the system administrator's GCP project. Restrict the key to the Text-to-Speech API only. Required for all `synthesizeSpeech` calls in §4.6. |
 | `FCM_SERVER_KEY` | Route-change FCM dispatcher (called from `audio-render-worker`) | Firebase Cloud Messaging server credential used to send push notifications to operator devices. |
 | `ADMIN_EMAIL` | Signup trigger / `retry-admin-notification` | Destination for new-operator signup notifications (§3.1). |
+| `SENTRY_DSN_ANDROID` | Android app (bundled at build time, not at runtime) | Sentry project DSN for the Android tablet app. Injected into the build via Gradle build config; not stored as a Supabase secret. See §11.2. |
+| `SENTRY_DSN_DASHBOARD` | Next.js dashboard | Sentry project DSN for the dashboard. Configured in Vercel environment variables. See §11.2. |
+| `SENTRY_DSN_EDGE` | All Edge Functions | Sentry project DSN for Edge Functions. Set as a Supabase secret. See §11.2. |
 
 **Setup checklist** (one-off, performed by the system administrator before the first
 deployment):
@@ -1386,3 +1577,8 @@ deployment):
 5. Complete the Reg 13(4) voice-frequency verification described in the Compliance Mapping
    Matrix and record the result in the operations runbook before serving any production
    traffic.
+6. Create three Sentry projects (Android, Dashboard, Edge Functions) and provision their
+   DSNs (§11.2). Store `SENTRY_DSN_EDGE` as a Supabase secret; configure
+   `SENTRY_DSN_DASHBOARD` in Vercel; inject `SENTRY_DSN_ANDROID` into the Android build
+   config. This is a one-off task at Stage 2/3 start (when the Android app and dashboard
+   exist); it does not block Stage 1 backend work.

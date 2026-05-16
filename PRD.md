@@ -7,7 +7,19 @@
 
 ## Changelog
 
-### v3.8 (May 2026)
+### v3.8 (May 2026 — item 2 of 4)
+Round-2 post-adversarial-review re-planning pass, item 2 of 4 (bug fixes and operational hardening: heartbeat lifecycle redesign, honest audio_enabled compliance framing, mid-journey suspension grace, Sentry telemetry, journey-summary upload).
+- FR-AT-64: Heartbeat rewritten around `ProcessLifecycleOwner`. Two paths reframed as "app-foregrounded" (reliable, ticks whenever any Activity is RESUMED — covers route browsing, route detail, admin menu, and active journeys) and "background/idle" (best-effort WorkManager). Foreground GPS service is no longer the heartbeat owner.
+- FR-AT-60: Mid-journey suspension is honoured at journey end, not mid-journey. If a sync arrives while a journey is active, the captured operator status is recorded but does not lock the UI. On journey end, if the captured status is `suspended` or `pending`, the app then transitions to the Account Status Screen.
+- FR-AT-57: Sync step 1 rewritten — the operator-status check no longer locks the UI when `journey_state.is_active = true`; the status is captured into local sync metadata and acted on at journey end.
+- §5.2: Multi-tablet audio designation is now framed honestly. Operator responsibility is explicit: exactly one tablet per physical bus with `audio_enabled = true`. The software provides the flag, sensible pairing defaults, and a soft fleet warning (FR-WD-22); it does not structurally enforce the one-per-bus invariant.
+- FR-WD-22 (new): Audio-Designation Warning — non-blocking dashboard warning when an operator's fleet has zero `audio_enabled = true` devices. Soft warning, can be dismissed.
+- FR-WD-23 (new): Device Journey Summary Drill-Down — per-device view in the fleet view showing recent journey-summary metrics (announced counts, GPS-reliability proxies, audio failures, diversion-invoked). No PII, no location traces.
+- NFR-R-07 (new): Crash Telemetry — Sentry on all three surfaces (Android, dashboard, Edge Functions). Free tier (5,000 errors/month). Breadcrumbs include `device_id` / `route_id` / `current_stop_index` as diagnostic identifiers; no PII.
+- §9 MoSCoW Must Have: Added Sentry crash-telemetry entry (Backend) and journey-summary upload entry (Backend + Android).
+- §11.2 Dependencies: Sentry added as a third-party service dependency.
+
+### v3.8 (May 2026 — item 1 of 4)
 Round-2 post-adversarial-review re-planning pass, item 1 of 4 (audio pipeline overhaul: pg_boss job queue, Google TTS lock-in, version-keyed Storage paths, render-then-FCM, content-hash differential re-render, render-status surface).
 - FR-WD-08: Saving a route enqueues a pg_boss audio-render job; the dashboard does not fire FCM on save.
 - FR-WD-13: Route list view now shows per-route `audio_render_status` (pending / ok / failed) with a re-render action on failed routes.
@@ -285,6 +297,28 @@ When an operator saves a route (create or modify), the dashboard enqueues a `ren
 
 **FR-WD-21: Re-Render Audio Action**
 Each route in the route list (FR-WD-13) offers a "Re-render audio" action. Clicking it calls `enqueue-render-job` with the route's current `updated_at` as `route_version`, pushing a fresh job onto the pg_boss queue regardless of the route's current `audio_render_status`. Used to recover from terminal failures (clearing `'failed'` back to `'pending'` and ultimately `'ok'` on success) or to force a re-render after an out-of-band Storage cleanup. The action does **not** modify the route data; it does not bump `updated_at` and does not create a new route version — the render runs against the current version's Storage path.
+
+**FR-WD-22: Audio-Designation Warning**
+When an operator toggles `audio_enabled` in the fleet view such that **zero** of their active devices would have `audio_enabled = true`, the dashboard displays a non-blocking warning before saving the change:
+
+> *"No tablets in your fleet will produce audio announcements. Buses operated with these tablets will run in silent mode, which may not meet PSVAR Reg 12(1)(b) audio requirements. Continue?"*
+
+The operator can dismiss the warning and continue (soft warning, **not** a hard block). This is a UX safeguard, not an enforcement mechanism — the operator retains the authority to configure their fleet as they see fit, and the software does not structurally enforce the multi-tablet audio-designation invariant (see §5.2 and Compliance Mapping Matrix Reg 12(1)(b)).
+
+**No warning is shown for the inverse case** ("multiple devices audio-on"). The software cannot detect that case as misconfiguration because it has no concept of "vehicle" — two audio-on devices may be perfectly correct if they're on two different buses, or perfectly wrong if they're on the same bus, and the software cannot tell which. Per-bus configuration remains the operator's responsibility.
+
+**FR-WD-23: Device Journey Summary Drill-Down**
+From the fleet view (FR-WD-15), clicking a device opens a per-device detail view listing recent journey summaries from the Supabase `journey_summaries` table (Data Architecture §2.6), scoped by `operator_id` RLS. Each row shows:
+- Route name (or "—" if the route has been hard-deleted since the journey)
+- Journey start and end timestamps
+- Stops announced count
+- Stops passed without detection count (GPS-reliability proxy)
+- Manual stop advances count (a second GPS-reliability proxy)
+- GPS-lost events count
+- Audio failures count
+- Whether a diversion was invoked
+
+The view is sorted by journey start (most recent first) and paginated. No location traces, no stop names, no PII — only counts and timestamps. This is a small operational drill-down for fleet-health diagnostics, **not** a full analytics dashboard (analytics remains a Could Have, §9). Journey summaries arrive via the tablet's post-journey upload (FR-AT-66).
 
 ---
 
@@ -592,9 +626,10 @@ Note: the heartbeat (FR-AT-64) is a separate mechanism and does not trigger a ro
 
 **FR-AT-57: Sync Sequence**
 Each sync runs in this order:
-1. Check operator account status. If `status = 'pending'`, lock the UI to an "Account pending approval — contact your administrator" screen and abort. If `status = 'suspended'`, lock the UI to an "Account Suspended — please contact your bus company administrator" screen and abort.
+1. Check operator account status. **If a journey is active (`journey_state.is_active = true`), capture the returned status into local sync metadata and continue sync; the UI is not locked.** If no journey is active and `status = 'pending'`, lock the UI to an "Account pending approval — contact your administrator" screen and abort. If no journey is active and `status = 'suspended'`, lock the UI to an "Account Suspended — please contact your bus company administrator" screen and abort. Mid-journey suspension is honoured at journey end (FR-AT-60), never mid-journey.
 2. Download remote changes (routes added/modified/deleted by the operator on the dashboard).
-3. Update last-sync state in sync_metadata.
+3. Upload pending journey summaries (FR-AT-66; Data Architecture §7.8). Non-fatal — failed uploads remain queued for the next sync.
+4. Update last-sync state in sync_metadata.
 
 **FR-AT-58: Sync Failure Handling**
 If sync fails, the app continues to operate from the local Room database. The sync status indicator shows "failed" until the next successful sync. The app does not retry aggressively on failure (to avoid battery drain); it waits for the next regular trigger.
@@ -603,9 +638,15 @@ If sync fails, the app continues to operate from the local Room database. The sy
 Last-write-wins, with the server-assigned `updated_at` timestamp as authority. Conflicts are extremely rare given dashboard-only authoring (no concurrent multi-device edits) but the architecture handles them correctly via the sync algorithm specified in the Data Architecture document.
 
 **FR-AT-60: Account Status Screen**
-If a sync detects the operator's account is not in `active` status, the app displays a status-specific screen and disables all journey functionality:
+When the app needs to surface that the operator's account is not in `active` status, it displays a status-specific screen and disables all journey functionality:
 - `status = 'pending'`: displays "Account pending approval — contact your administrator."
 - `status = 'suspended'`: displays "Account Suspended — please contact your bus company administrator."
+
+**When the screen is shown.** The screen is shown:
+- After a sync that completes with `journey_state.is_active = false` and returns `status != 'active'` (FR-AT-57 step 1).
+- At journey end, if `sync_metadata.pending_account_status` is non-NULL (FR-AT-66 / Data Architecture §7.8 step 6). This is the mid-journey-suspension grace path: a sync that arrived while a journey was active captured the non-active status; the journey continued normally; on journey end the captured status is honoured and the screen is shown.
+
+**Mid-journey suspension is honoured at journey end.** If a sync arrives while `journey_state.is_active = true`, the captured operator status is stored but does not lock the UI. The driver completes the current journey normally. On journey end (driver-ended, auto-timeout, or natural termination), if the most recently captured operator status is `suspended` (or `pending`), the app then transitions to the Account Status Screen. Rationale: a bus in service with passengers must not lose its display mid-journey. The cost — one final journey of "unpaid" service after suspension — is acceptable and recoverable via invoicing. This behaviour is humane and operationally correct.
 
 The screen rechecks status on each sync. When the operator's status returns to `active`, the app returns to normal operation without requiring re-pairing.
 
@@ -632,15 +673,37 @@ The app silently logs key events to the local Room database for diagnostic purpo
 Logs are stored locally only (not synced). They are accessible via the admin menu for troubleshooting. Logs older than 30 days are auto-deleted on app startup.
 
 **FR-AT-64: Heartbeat Mechanism**
-The app sends a lightweight heartbeat to Supabase every 2 minutes whenever it has connectivity. The heartbeat performs a single operation: updating `devices.last_seen_at` to the current timestamp. It is independent of route sync and runs during active journeys as well as when the app is idle.
+The app sends a lightweight heartbeat to Supabase every 2 minutes whenever it has connectivity. The heartbeat performs a single operation: updating `devices.last_seen_at` to the current timestamp. It is independent of route sync and runs whenever the app is foregrounded (whether or not a journey is active) and best-effort when the app is backgrounded.
+
+**Ownership:** The heartbeat is owned by an **application-level lifecycle observer** — a Hilt-injected singleton observing `ProcessLifecycleOwner`. The foreground GPS service is **not** the heartbeat owner. The GPS service exists for stop detection during journeys; the heartbeat lives at a higher level so that its lifecycle is tied to the app being foregrounded, not to whether a journey is in progress.
 
 Implementation:
-- **During active journeys:** A 2-minute `Handler.postDelayed` loop runs inside the foreground GPS service. The foreground service is protected from OEM battery-optimisation kills, ensuring the heartbeat is reliable during the critical in-service window.
-- **When idle/backgrounded:** A WorkManager `PeriodicWorkRequest` with a 2-minute interval handles heartbeats when no journey is active.
+- **App-foregrounded path (reliable):** A `Handler`-based ticker tied to `ProcessLifecycleOwner.get().lifecycle` — fires whenever any Activity is in `RESUMED` state. Covers route browsing, route detail, admin menu, active journey — any time the driver has the tablet on and looking at the app. Because the app is foregrounded, the OS does not throttle this loop. This path closes the previously-uncovered "foregrounded but no journey active" state (e.g., driver has tablet on, looking at the route list, deciding what to run).
+- **Background/idle path (best-effort):** A WorkManager `PeriodicWorkRequest` with a 2-minute interval handles heartbeats when the app is backgrounded or the screen is off. Best-effort on hostile OEMs.
 
 Heartbeat failures are silent. There is no UI indication of a missed heartbeat, no retry, and no impact on journey operation. The next successful heartbeat updates the timestamp.
 
 The heartbeat interval (2 minutes) and online threshold (5 minutes, see FR-WD-15) are chosen so that a healthy tablet comfortably maintains "online" status: 2-minute heartbeat + 3-minute network-hiccup margin = 5-minute threshold.
+
+See Data Architecture §7.7 for the full implementation specification and the OEM best-effort caveat that applies to the background path.
+
+**FR-AT-66: Journey Summary Upload**
+At journey end (driver-ended, auto-timeout, or natural termination), the app writes a single anonymous-count summary row to local storage (Data Architecture §5.8 `journey_summaries_pending`) before clearing `journey_state`. On the next sync (and subsequent syncs while any rows remain pending), the app uploads queued summaries into the Supabase `journey_summaries` table (Data Architecture §2.6) under the device's authenticated session.
+
+The summary contains only counts and timestamps:
+- Journey start and end timestamps
+- Count of stops announced (GPS-triggered and manual)
+- Count of stops passed without GPS detection (a GPS-reliability proxy)
+- Count of manual stop advances (a second GPS-reliability proxy)
+- Count of GPS-lost events
+- Count of audio failures (file-missing + playback errors)
+- Whether a diversion was invoked at any point
+
+**No PII, no location traces, no stop names.** The data is a deliberately reduced operational signal for fleet-health drill-down via FR-WD-23. Operators see their own summaries via dashboard RLS.
+
+Upload is non-real-time and does not violate offline-first: a tablet that operates offline for days will back-fill summaries on next sync. Upload failures leave the row in `journey_summaries_pending` for retry; they do not fail the sync. On successful upload, the local row is deleted (the local table is a short-lived queue, not a permanent record).
+
+If suspension was captured during the just-ended journey (see FR-AT-60), the journey-end transition routes to the Account Status Screen rather than back to the route list.
 
 ---
 
@@ -665,6 +728,8 @@ For larger buses where a single front-mounted tablet cannot meet the 51% sightli
 The designation is controlled by a per-device `audio_enabled` flag in the `devices` table, configurable from the dashboard fleet view. The fleet manager sees an "Audio" toggle next to each device in the fleet list and can enable it on exactly one device per bus. **Default at pairing time:** the first tablet paired to an operator account has `audio_enabled = true`; every subsequent tablet defaults to `audio_enabled = false`. Operators deploying a single tablet require no configuration. Operators deploying multiple tablets should leave the default (which correctly designates the first-paired device as audio) or adjust via the fleet view.
 
 The tablet reads `audio_enabled` from its device record after each sync and applies it immediately. If `audio_enabled` is false, the audio playback engine is disabled for the entire session; the visual display continues normally.
+
+**Operator responsibility — explicit:** The operator is responsible for ensuring **exactly one tablet per physical bus** has `audio_enabled = true`. Misconfiguration produces either silent operation (no audio-on tablet on a bus, meaning the bus runs with no audio announcements) or overlapping audio (multiple audio-on tablets on one bus, producing slightly offset playback that violates Reg 12(1)(b) consistency). The software provides the per-device toggle, sensible pairing defaults (first-paired = audio-on; subsequent = audio-off), and a soft dashboard warning for the fleet-wide zero-audio-devices case (FR-WD-22); it does **not** structurally enforce the one-per-bus invariant — `devices` has no concept of "vehicle" and there is no database constraint preventing multiple `audio_enabled = true` devices per operator. Compliance with Reg 12(1)(b) consistency therefore depends on correct operator configuration in addition to the software's per-device guarantees. See the Compliance Mapping Matrix Reg 12(1)(b) row and the Responsibility Boundary Summary "Audio-device designation" row for the full split.
 
 True primary-secondary tablet linking with shared journey state is deferred. The architecture accommodates it (journey state is already in local Room and can be projected to other devices via Supabase Realtime later), but the initial release does not implement it.
 
@@ -783,6 +848,8 @@ When the dashboard creates a route stop, the stop's NaPTAN ID, name, CRS code, a
 
 **NFR-R-06:** Dashboard uptime shall meet Vercel's free-tier SLA. Dashboard outages do not affect tablets in active journeys.
 
+**NFR-R-07: Crash Telemetry.** All three surfaces (Android tablet app, Next.js dashboard, Supabase Edge Functions) integrate Sentry (sentry.io) for crash and error reporting. The Android SDK captures unhandled exceptions, ANRs, and session crashes; the Next.js SDK captures client-side React errors, server-side rendering errors, and server-action errors; Edge Function SDKs report errors from `pair-device`, `recover-device`, `generate-pairing-code`, `enqueue-render-job`, `audio-render-worker`, `audio-cleanup-worker`, and `retry-admin-notification`. Breadcrumbs include diagnostic identifiers (`device_id`, `route_id`, `current_stop_index`) but exclude operator names; the system contains no passenger PII. The Sentry SDK fails open — if Sentry itself is unavailable, application behaviour is unaffected. Free-tier quota (5,000 errors/month) is expected to be sufficient at projected fleet size. Three separate Sentry projects (one per surface) are provisioned at Stage 2/3 start; DSNs are delivered via environment variables (`SENTRY_DSN_ANDROID`, `SENTRY_DSN_DASHBOARD`, `SENTRY_DSN_EDGE`). See Data Architecture §11.2.
+
 ### 8.3 Security
 
 **NFR-S-01:** Operator data is isolated in Supabase via Row-Level Security policies bound to JWT claims. No operator can read, modify, or delete another operator's routes or devices.
@@ -868,9 +935,10 @@ The product is built as a single coherent release. The MoSCoW list below describ
 - Foreground GPS service with battery optimisation bypass
 - Offline-first operation with sync
 - FCM token registration and push notification receipt for instant route sync
-- Account suspension lock
+- Account suspension lock (honoured at journey end for mid-journey suspensions — FR-AT-60)
 - Journey state recovery
 - Journey event logging (local only)
+- Journey summary upload at journey end (anonymous count metrics — FR-AT-66)
 
 **Backend:**
 - Supabase project with operator-scoped RLS
@@ -884,6 +952,9 @@ The product is built as a single coherent release. The MoSCoW list below describ
 - Cursor-based sync RPC
 - NaPTAN data table with full-text search
 - FCM dispatch (fired from the audio render worker on successful job completion — render-then-FCM ordering)
+- `journey_summaries` Supabase table receiving per-journey count metrics uploaded by tablets (Data Architecture §2.6)
+- Per-device journey-summary drill-down in the dashboard fleet view (FR-WD-23)
+- Crash telemetry via Sentry on all three surfaces (Android, dashboard, Edge Functions) — three Sentry projects, one DSN per surface (NFR-R-07; Data Architecture §11.2)
 
 ### Should Have (Initial Release if Time Permits)
 
@@ -971,6 +1042,7 @@ The detailed clause-by-clause mapping is provided in the Compliance Mapping Matr
 4. **Vercel** — dashboard hosting. Subject to Vercel's free-tier limits.
 5. **Next.js** — dashboard framework.
 6. **NaPTAN open data** — published by the Department for Transport under UK Open Government Licence.
+7. **Sentry (sentry.io)** — crash-reporting and error-tracking SDK for the Android tablet app, the Next.js dashboard, and Supabase Edge Functions. Free tier (5,000 errors/month) sufficient at projected fleet size. One DSN per project (three DSNs total); DSN delivered via environment variable in each surface's build/runtime configuration. Sustained Sentry outages do not affect application behaviour — the SDK fails open. See Data Architecture §11.2 and NFR-R-07.
 
 ---
 
