@@ -1,11 +1,21 @@
 # Product Requirements Document (PRD)
 # Passenger Display System (PDS)
 
-**Version:** 3.7
+**Version:** 3.8
 **Last Updated:** May 2026
 **Status:** Pre-Development
 
 ## Changelog
+
+### v3.8 (May 2026)
+Round-2 post-adversarial-review re-planning pass, item 1 of 4 (audio pipeline overhaul: pg_boss job queue, Google TTS lock-in, version-keyed Storage paths, render-then-FCM, content-hash differential re-render, render-status surface).
+- FR-WD-08: Saving a route enqueues a pg_boss audio-render job; the dashboard does not fire FCM on save.
+- FR-WD-13: Route list view now shows per-route `audio_render_status` (pending / ok / failed) with a re-render action on failed routes.
+- FR-WD-20: Major rewrite. Pre-rendered audio is produced by an async pg_boss job, not by a synchronous Edge Function. TTS voice locked to Google Cloud `en-GB-Neural2-B`. Storage paths are version-keyed. Differential re-rendering via content hashes. Render-then-FCM. Partial-failure resumption.
+- FR-WD-21 (new): Re-Render Audio action — re-enqueues a render job for the current route version, useful after terminal failures.
+- §11.2 Dependencies: Google Cloud Text-to-Speech locked in as a hard external dependency.
+- §12 Success Metrics: 5-minute propagation clock now starts at successful render (+ typical render time noted).
+- §13 Risks: Added Google TTS outage / quota row.
 
 ### v3.7 (May 2026)
 Post-adversarial-review re-planning pass, item 7 of 7 (compliance, WORKFLOW, smaller items, and campaign close-out).
@@ -196,6 +206,8 @@ For each stop in the route, the builder displays a proximity radius field pre-fi
 
 For each stop, the builder also shows a segment type selector, defaulting to "Scheduled stop." The operator can switch individual stops to "Hail and ride" to mark them as part of a hail-and-ride section. Consecutive stops marked as hail and ride form a hail-and-ride section; the dashboard visually groups them as a section in the stop list. The value is saved in `route_stops.segment_type` and synced to tablets as part of the route.
 
+**Save behaviour and audio rendering.** Saving a route (creating or modifying) is a two-step operation on the dashboard: (1) the atomic `replace_route_with_stops` RPC writes the route and its stops, and (2) the dashboard calls `enqueue-render-job` which pushes a `render-route-audio` job onto the pg_boss queue (see Data Architecture §4.6 and FR-WD-20). The route appears in the operator's route list immediately with `audio_render_status = 'pending'`; the status flips to `ok` (or `failed`) when the `audio-render-worker` processes the job. The dashboard does not wait for the render and does **not** fire any FCM push at save time — FCM dispatch is the render worker's responsibility on successful completion, ensuring tablets are notified only once the audio is downloadable.
+
 **FR-WD-09: NaPTAN Search**
 The dashboard provides full-text search across all UK NaPTAN entries (bus stops and railway stations, ~400,000 records). Search results display the stop name, NaPTAN identifier, locality, and (for railway stations) the 3-letter CRS code, to disambiguate similarly named stops. Search is performed against the `naptan_stations` table in Supabase using Postgres full-text search.
 
@@ -215,7 +227,14 @@ When saving a route, the dashboard offers a "Generate return route" action that 
 **Return-route divergence detection:** Once a return route has been generated and either route is subsequently edited, the routes may diverge (different stops, different order). To surface this, each route carries a `last_synced_with_return` timestamp (see Data Architecture §2.4). When a return route is generated, both routes have `last_synced_with_return` set to the moment of generation. On the dashboard, when an operator saves an edit to a route that has a `return_route_id` AND the route's `updated_at` is newer than its `last_synced_with_return`, the dashboard displays a warning: *"This route has a linked return route that may now be divergent. [Re-generate return route] [Keep existing return]."* Choosing [Re-generate] replaces the linked return route's stop list with the current route's stops in reverse order, resets `last_synced_with_return` on both routes, and triggers audio re-rendering for the return route. Choosing [Keep existing return] dismisses the warning without further action. This is a warning-and-regenerate mechanism, not a diff UI. The operator is responsible for reviewing the linked route if they choose to keep it.
 
 **FR-WD-13: Route List View**
-The dashboard provides a list of all routes belonging to the operator, with name, route number, direction, stop count, and last-modified timestamp. Routes can be filtered or searched by name. Soft-deleted routes are hidden from this view.
+The dashboard provides a list of all routes belonging to the operator, with name, route number, direction, stop count, last-modified timestamp, and **audio render status**. Routes can be filtered or searched by name. Soft-deleted routes are hidden from this view.
+
+**Audio render status surface.** Each row shows the route's `audio_render_status` (see Data Architecture §2.4) as a small badge:
+- `pending` — grey "Rendering…" pill with a subtle spinner.
+- `ok` — no badge displayed (the default healthy state). The route name renders normally.
+- `failed` — red "Audio render failed" pill. The badge is clickable and reveals the `audio_render_error` text from the route row for diagnostic purposes. A "Re-render audio" action (FR-WD-21) appears on the row, which re-enqueues the render job for the route's current version.
+
+The dashboard may use Supabase Realtime to subscribe to `routes` updates so the status updates without a manual refresh; if Realtime is not wired up in the initial release, a manual page refresh is acceptable and the change is visible on next load.
 
 ### 3.3 Device Management
 
@@ -246,13 +265,26 @@ The dashboard is deployed on Vercel using Next.js. The free tier is sufficient f
 All dashboard traffic uses HTTPS exclusively. No mixed-content or insecure connections are permitted.
 
 **FR-WD-20: Route Audio Rendering**
-When an operator saves a route (creates or modifies), the dashboard calls the `render-route-audio` Edge Function asynchronously after the route is persisted. The Edge Function renders route-specific audio files using a server-side TTS API with a single configured voice:
+When an operator saves a route (create or modify), the dashboard enqueues a `render-route-audio` pg_boss job via the `enqueue-render-job` Edge Function. The job is processed asynchronously by the `audio-render-worker` Edge Function on a 1-minute schedule (see Data Architecture §4.6). The render produces:
 - Route announcement: "This bus is the [Route Name] service to [Final Stop]."
 - Per-stop next-stop announcement for each stop N: "Next stop: [Stop Name]."
 
-Rendered files are stored in Supabase Storage, keyed by operator ID, route ID, and stop order (see Data Architecture §2.7). The dashboard does not block on rendering; the route appears immediately in the operator's route list. Tablets download audio files on their next sync after rendering completes.
+**TTS provider (locked):** Google Cloud Text-to-Speech, voice `en-GB-Neural2-B`. The voice is **not** configurable per operator, per route, or per deployment. Changing it requires re-running the Reg 13(4) frequency verification (see Compliance Mapping Matrix) and is therefore a deliberate compliance event. This is an inviolable architectural rule.
 
-Fixed announcement texts (termination, hail-and-ride start/end, diversion start/end) are not rendered at route-save time — they are rendered once and bundled in the APK, using the same TTS voice as the route-specific files, to ensure a consistent audio experience across all announcement types.
+**Version-keyed Storage paths.** Each route save produces a fresh `routes.updated_at` (the route version) and therefore a fresh Storage path prefix `{operator_id}/{route_id}/{route_version}/...mp3` (see Data Architecture §2.7). Concurrent saves cannot race on the same path by construction. The daily Storage cleanup job retains the two most recent versions per route.
+
+**Differential re-rendering via content hashes.** Each rendered audio file has an associated content hash recorded on the database (`route_stops.audio_content_hash`; `routes.audio_announcement_hash`). On re-render, the worker computes the would-be hash for each piece of text and only re-renders stops whose hash has changed. Files whose text is unchanged are server-side-copied from the previous route version's Storage path into the new version's path, so a direction-label-only edit (which changes no announcement text) calls Google TTS zero times. This keeps per-edit TTS cost proportional to the number of stops whose text actually changed.
+
+**Render-then-FCM.** FCM push notifications to the operator's tablets are fired by the audio-render-worker only on **successful** job completion. The dashboard does not fire FCM at save time. A failed render does not push; tablets see the `failed` status on their next regular sync trigger and skip audio download for that route (the journey-start gate stays closed).
+
+**Failure visibility on the dashboard.** A render that exhausts pg_boss's retry budget (5 retries with exponential backoff: 30s, 60s, 120s, 240s, 480s) ends in `audio_render_status = 'failed'` with the captured error message in `audio_render_error`. The route list (FR-WD-13) surfaces this state on the affected route's row with a red badge, the error detail, and a "Re-render audio" action (FR-WD-21).
+
+**Partial-failure resumption.** If a render job fails mid-route (e.g., on stop 7 of 12), stops 0–6 are already in Storage with their hashes recorded in `route_stops.audio_content_hash`. pg_boss retries the job; the retry resumes via the content-hash check, skipping already-rendered stops and resuming from the failed step. No explicit resumption state is required — the content-hash bookkeeping is the resumption mechanism.
+
+**Fixed announcement texts** (termination, hail-and-ride start/end, diversion start/end) are not rendered at route-save time — they are rendered once during development using the **same locked voice (`en-GB-Neural2-B`)** and bundled in the APK, ensuring a consistent audio experience across all announcement types.
+
+**FR-WD-21: Re-Render Audio Action**
+Each route in the route list (FR-WD-13) offers a "Re-render audio" action. Clicking it calls `enqueue-render-job` with the route's current `updated_at` as `route_version`, pushing a fresh job onto the pg_boss queue regardless of the route's current `audio_render_status`. Used to recover from terminal failures (clearing `'failed'` back to `'pending'` and ultimately `'ok'` on success) or to force a re-render after an out-of-band Storage cleanup. The action does **not** modify the route data; it does not bump `updated_at` and does not create a new route version — the render runs against the current version's Storage path.
 
 ---
 
@@ -843,13 +875,15 @@ The product is built as a single coherent release. The MoSCoW list below describ
 **Backend:**
 - Supabase project with operator-scoped RLS
 - Edge Functions for `pair-device`, `recover-device`, and `generate-pairing-code`
-- Edge Function `render-route-audio` for server-side audio rendering at route-save time
-- Supabase Storage bucket `route-audio` for per-route pre-rendered audio files
+- pg_boss-backed audio render pipeline: `enqueue-render-job` (called by the dashboard on save) and `audio-render-worker` (scheduled every minute) — see FR-WD-20 and Data Architecture §4.6
+- Locked Google Cloud Text-to-Speech voice `en-GB-Neural2-B` for all server-rendered announcement audio
+- Supabase Storage bucket `route-audio` with version-keyed paths for per-route pre-rendered audio files; daily `audio-cleanup-worker` retains two most-recent versions
+- `audio_render_status` / `audio_render_error` / per-stop and per-route content-hash columns surfacing render outcome on the dashboard route list
 - Server-side timestamp triggers
 - Atomic route + stops upsert RPC
 - Cursor-based sync RPC
 - NaPTAN data table with full-text search
-- Edge Function to send FCM push notifications to operator devices on route change
+- FCM dispatch (fired from the audio render worker on successful job completion — render-then-FCM ordering)
 
 ### Should Have (Initial Release if Time Permits)
 
@@ -933,7 +967,7 @@ The detailed clause-by-clause mapping is provided in the Compliance Mapping Matr
 
 1. **Google Play Services** — required for FusedLocationProviderClient and FCM.
 2. **Supabase** — backend for auth, database, Edge Functions, Storage, and FCM relay. Subject to Supabase's SLA.
-3. **Server-side TTS API** (e.g., Google Cloud Text-to-Speech) — used by the `render-route-audio` Edge Function to render announcement audio server-side. This is a dashboard/server-side dependency only; the tablet has no TTS dependency.
+3. **Google Cloud Text-to-Speech (locked)** — used by the `audio-render-worker` Edge Function (see Data Architecture §4.6) to render announcement audio server-side. **Voice is locked to `en-GB-Neural2-B`.** This is a hard external dependency with metered API costs (approximately $16 per 1M characters as of late 2025; a typical 10-stop route's first full render costs ~$0.004, and edits typically cost fractions of a cent thanks to content-hash differential rendering). The system administrator owns the GCP project and the restricted API key. Sustained Google TTS outages or quota breaches will surface as `audio_render_status = 'failed'` on the dashboard. The tablet has no TTS dependency.
 4. **Vercel** — dashboard hosting. Subject to Vercel's free-tier limits.
 5. **Next.js** — dashboard framework.
 6. **NaPTAN open data** — published by the Department for Transport under UK Open Government Licence.
@@ -947,7 +981,7 @@ The detailed clause-by-clause mapping is provided in the Compliance Mapping Matr
 - Zero crashes during active journeys
 - Announcements trigger at the correct stop with at least 95% accuracy
 - Driver can start a journey from a powered-on tablet in under 30 seconds
-- Fleet manager can create a new route on the dashboard and have it appear on a tablet within 5 minutes (requires FCM — a Must-Have feature, §9 — for tablets that are already online; ConnectivityManager handles the offline→online case)
+- Fleet manager can create a new route on the dashboard and have it appear on a tablet within **5 minutes from successful audio render** (plus typical render time of 30–60 seconds for an average route). The render-then-FCM flow (see FR-WD-20 and Data Architecture §4.6) means a tablet receives the FCM push only once audio is downloadable, avoiding the "route data arrived but audio is still pending" UX. End-to-end save-to-tablet wall-clock for a typical 10-stop route is therefore approximately 1–6 minutes: 15–60s render time + up to 60s worker-scheduling delay (the worker runs every minute) + sub-5-minute FCM-and-sync propagation. This requires FCM — a Must-Have feature, §9 — for tablets that are already online; ConnectivityManager handles the offline→online case. Routes whose render terminally fails do not propagate via FCM at all and surface on the dashboard for operator action.
 - Positive qualitative feedback from driver, fleet manager, and at least one passenger
 
 ### Product-Market Fit (first 3 paying customers)
@@ -971,6 +1005,7 @@ The detailed clause-by-clause mapping is provided in the Compliance Mapping Matr
 | Supabase service disruption | Cannot sync new routes; pairings fail | Low | Offline-first design means active routes are unaffected; outages affect onboarding only |
 | Dashboard service disruption | Cannot manage routes or pair new devices | Low | Tablets continue operating from cached data |
 | Operator subscribes via self-signup but has no intention of paying | Wasted resources, system abuse | Medium | Manual approval gate before any tablet functions |
+| Google Cloud TTS outage or API quota breach | Render jobs fail; new/edited routes show `audio_render_status='failed'` on the dashboard; tablets cannot start journeys on those routes (journey-start gate blocks) | Low | pg_boss retries with exponential backoff cover transient outages (5 retries: 30s, 60s, 120s, 240s, 480s). Sustained outages surface clearly on the dashboard for operator escalation rather than silently failing. Locked voice means no fallback voice substitution — degraded output never ships in place of the verified voice. The "Re-render audio" action (FR-WD-21) recovers transient terminal failures once Google TTS is healthy again. |
 
 ---
 

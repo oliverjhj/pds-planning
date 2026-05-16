@@ -1,11 +1,26 @@
 # Data Architecture Document
 # Passenger Display System (PDS)
 
-**Version:** 3.7
+**Version:** 3.8
 **Last Updated:** May 2026
-**PRD Alignment:** PRD v3.7
+**PRD Alignment:** PRD v3.8
 
 ## Changelog
+
+### v3.8 (May 2026)
+Round-2 post-adversarial-review re-planning pass, item 1 of 4 (audio pipeline overhaul: pg_boss job queue, Google TTS lock-in, version-keyed Storage paths, render-then-FCM, content-hash differential re-render, render-status surface).
+- §2.4: Added `audio_render_status` (`pending`/`ok`/`failed`), `audio_render_error`, and `audio_announcement_hash` columns to the routes table.
+- §2.5: Added `audio_content_hash` column to route_stops for differential re-rendering.
+- §2.7: Storage path scheme is now version-keyed (`{operator_id}/{route_id}/{route_version}/...`) where `route_version = routes.updated_at` epoch millis. Each save produces fresh paths; cleanup retains two most recent versions.
+- §4.4: Saving a route now enqueues a pg_boss job via `enqueue-render-job`; the dashboard does not fire FCM on save.
+- §4.6: Replaced the synchronous `render-route-audio` Edge Function with a pg_boss-backed job queue and scheduled worker (`audio-render-worker`). Locked TTS voice to Google Cloud TTS `en-GB-Neural2-B`. Specified retry policy, content-hash differential rendering, version-path copy for unchanged stops, partial-failure resumption, and render-then-FCM dispatch.
+- §4.7 (new): Daily Storage cleanup job (`audio-cleanup-worker`) keeps the two most recent versions per route.
+- §7.2, §7.4: Tablet audio download uses version-keyed paths derived from `routes.updated_at`. Tablet skips audio download for routes whose `audio_render_status = 'failed'`.
+- §7.6: FCM dispatch is now triggered by the render worker on success, not by a routes-table trigger.
+- §8.4: Data-flow diagram replaced — render runs to completion before FCM fires; rendering is asynchronous and observable via `audio_render_status`.
+- §10: Audio retention clarified — two most recent versions per route.
+- §11: Implementation notes updated for content-hash differential rendering, locked voice, and pg_boss schema ownership.
+- §12 (new): Centralised environment variables, including `GOOGLE_TTS_API_KEY`.
 
 ### v3.7 (May 2026)
 Post-adversarial-review re-planning pass, item 7 of 7 (compliance, WORKFLOW, smaller items, and campaign close-out).
@@ -178,8 +193,11 @@ Route definitions. Each route belongs to one operator. Routes are authored exclu
 | direction | TEXT | NULLABLE | Direction label: "Outbound", "Return", or custom |
 | return_route_id | UUID | FK → routes(id) DEFERRABLE INITIALLY DEFERRED, NULLABLE | Links to the return route. Deferrable so an outbound + return pair can be inserted in a single transaction. |
 | last_synced_with_return | TIMESTAMPTZ | NULLABLE, DEFAULT NULL | Timestamp set on both routes when a return route is generated (FR-WD-12). Used by the dashboard to detect divergence: if `updated_at > last_synced_with_return` and `return_route_id IS NOT NULL`, the dashboard warns the operator that the linked return route may now be divergent and offers to regenerate it. NULL if no return has ever been generated for this route. |
-| updated_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | Server-assigned via trigger on every INSERT or UPDATE. Used as the sync cursor. |
+| updated_at | TIMESTAMPTZ | NOT NULL, DEFAULT now() | Server-assigned via trigger on every INSERT or UPDATE. Used as the sync cursor and as the `route_version` segment of the Storage path scheme (§2.7), expressed as epoch milliseconds. |
 | is_deleted | BOOLEAN | NOT NULL, DEFAULT false | Soft delete flag. Deleted routes remain for sync propagation. |
+| audio_render_status | TEXT | NOT NULL, DEFAULT 'pending', CHECK (audio_render_status IN ('pending', 'ok', 'failed')) | Current state of the audio render job for this route version. `pending` immediately after `replace_route_with_stops`. Flipped to `ok` by the audio render worker on successful completion (§4.6); flipped to `failed` after the worker exhausts its retries. The dashboard surfaces this status in the route list (PRD FR-WD-13); the tablet uses it to skip audio download for failed routes (§7.4). |
+| audio_render_error | TEXT | NULLABLE | Last error message captured when `audio_render_status = 'failed'`. NULL when status is `pending` or `ok`. Cleared back to NULL by the worker on a successful re-render. Surfaced on the dashboard for diagnostic purposes. |
+| audio_announcement_hash | TEXT | NULLABLE | SHA-256 hex of the route-announcement text (`"This bus is the [route.name] service to [last_stop.stop_name]."`) that was rendered into the currently-stored `route_announcement.mp3`. Compared by the audio render worker against the would-be hash on re-render to skip rendering when unchanged. NULL until the first successful render of this route. See §4.6 for the differential re-render algorithm. |
 
 **Indexes:** `(operator_id, is_deleted, updated_at)` composite for sync queries.
 
@@ -200,6 +218,7 @@ Ordered list of stops within a route. Stops are always synced as a complete set 
 | is_custom | BOOLEAN | NOT NULL, DEFAULT false | False in the initial release. Reserved for the future custom-stop feature. |
 | proximity_radius_meters | INTEGER | NOT NULL, DEFAULT 200 | Per-stop GPS proximity radius in metres. The app triggers a stop announcement when a qualifying GPS fix places the bus within this radius. Set per stop in the dashboard route builder; 200m is the pre-filled default. Operators can set a larger value for motorway stops or a smaller value for dense urban stops. |
 | segment_type | TEXT | NOT NULL, DEFAULT 'scheduled', CHECK (segment_type IN ('scheduled', 'hail_and_ride')) | The stop's segment classification. 'scheduled' for a normal timetabled stop; 'hail_and_ride' for a stop within a hail-and-ride section. A contiguous run of 'hail_and_ride' stops constitutes a hail-and-ride section. Set per stop in the dashboard route builder; 'scheduled' is the pre-filled default. |
+| audio_content_hash | TEXT | NULLABLE | SHA-256 hex of the per-stop announcement text (`"Next stop: [stop.stop_name]."`) that was rendered into the currently-stored `stop_{stop_order}.mp3` for this stop. Used by the audio render worker to skip re-rendering when the stop's text has not changed (§4.6 differential re-render). NULL until this stop has been successfully rendered at least once. |
 
 **Indexes:** `route_id` (for loading all stops for a route).
 
@@ -234,36 +253,49 @@ start/end) are bundled in the APK and are not stored here.
 
 **Bucket:** `route-audio` (private)
 
-**Path scheme:**
+**Path scheme (version-keyed):**
 
 | Path | Content |
 |---|---|
-| `{operator_id}/{route_id}/route_announcement.mp3` | "This bus is the [Route Name] service to [Final Stop]." |
-| `{operator_id}/{route_id}/stop_{stop_order}.mp3` | "Next stop: [Stop Name]." for stop at position N |
+| `{operator_id}/{route_id}/{route_version}/route_announcement.mp3` | "This bus is the [Route Name] service to [Final Stop]." |
+| `{operator_id}/{route_id}/{route_version}/stop_{stop_order}.mp3` | "Next stop: [Stop Name]." for stop at position N |
 
-Stop order values match `route_stops.stop_order` (0-based). A route with 10 stops produces 11 files:
-one route announcement plus `stop_0.mp3` through `stop_9.mp3`.
+`route_version` is `routes.updated_at` expressed as epoch milliseconds (e.g. `1715846400000`).
+Each route save produces a freshly-stamped `updated_at` (via the trigger in §3.5) and therefore
+a fresh path prefix. Stop order values match `route_stops.stop_order` (0-based). A 10-stop route
+produces 11 files per version: one route announcement plus `stop_0.mp3` through `stop_9.mp3`.
+
+**Race-safety by construction:** Two concurrent saves cannot collide on the same Storage path
+because each save yields a different `updated_at`. The newer save enqueues its own render job;
+the older job's worker detects staleness on dequeue (§4.6 job-processing step 1) and exits
+without rendering.
 
 **Access model:** Storage RLS policies scope read access by operator_id. A device JWT may read
-files only under `{their_operator_id}/`. Dashboard users may read and write files under their
-own `{operator_id}/`. Write operations are performed by the `render-route-audio` Edge Function
-running with service-role access.
+files only under `{their_operator_id}/`. Dashboard users may read files under their own
+`{operator_id}/`. Write operations are performed by the `audio-render-worker` Edge Function
+(§4.6) running with service-role access.
 
-**Audio format:** MP3, mono, 32kbps. Sufficient quality for spoken announcements; ~20KB per
-5-second file.
+**Audio format:** MP3, mono, 22.05kHz sample rate, ~32kbps. Sufficient quality for spoken
+announcements; ~20KB per 5-second file.
 
-**Storage size estimate:** A 10-stop route produces approximately 220KB of audio. A 50-stop
-route produces approximately 1MB. Audio file sync adds negligible bandwidth relative to the
+**Storage size estimate:** A 10-stop route produces approximately 220KB of audio per version.
+With the two-version retention policy (§4.7), the steady-state Storage footprint per route is
+approximately 2× a single version. Audio file sync adds negligible bandwidth relative to the
 route data itself.
 
 **Lifecycle:**
-- **Created:** When the dashboard saves a route, it calls `render-route-audio` (§4.6) asynchronously.
-  Files appear in Storage when rendering completes, which typically takes seconds to low minutes.
-- **Updated:** Any route save (even a minor edit) triggers a full re-render. Existing files are
-  overwritten. Tablets re-download all files for that route on next sync, because the route's
-  `updated_at` changed.
-- **Deleted:** When a route is hard-deleted from Storage (during data retention cleanup — see §10),
-  the corresponding `{operator_id}/{route_id}/` folder is removed from the bucket.
+- **Created:** When the dashboard saves a route, it enqueues a `render-route-audio` pg_boss job
+  (§4.6). The `audio-render-worker` writes files at the new `{route_version}` path prefix.
+  The route's `audio_render_status` is `pending` until the worker completes successfully
+  (`ok`) or exhausts its retries (`failed`).
+- **Updated:** Each route save produces a new `route_version` and therefore a new path prefix.
+  The previous version's files remain in Storage until the cleanup job removes them. Tablets
+  syncing the updated route pull audio from the new path; tablets that already have the
+  previous version's audio downloaded are unaffected until they next sync.
+- **Cleaned:** A daily scheduled cleanup job (`audio-cleanup-worker`, §4.7) removes all but
+  the two most-recent versions per route.
+- **Deleted:** When a route is hard-deleted (data retention cleanup, §10), the entire
+  `{operator_id}/{route_id}/` folder — every version — is removed from the bucket.
 
 ---
 
@@ -541,40 +573,203 @@ The server's `updated_at` trigger fires automatically on the route UPSERT.
 
 This RPC is what the dashboard calls when saving a route.
 
-**Audio rendering:** After calling this RPC successfully, the dashboard also calls the
-`render-route-audio` Edge Function (§4.6) asynchronously to render and store the audio files
-for the saved route. The RPC itself is synchronous and completes before rendering begins; the
-route is immediately available in the dashboard while audio renders in the background.
+**Audio rendering:** After calling this RPC successfully, the dashboard calls the
+`enqueue-render-job` Edge Function (§4.6) which enqueues a `render-route-audio` job onto the
+pg_boss queue. The dashboard does not call any synchronous render API and does not wait for
+the render to complete. The route appears in the route list immediately with
+`audio_render_status = 'pending'`; the status flips to `ok` (or `failed`) when the
+`audio-render-worker` processes the job. The dashboard does **not** fire any FCM push on save —
+FCM dispatch is the render worker's responsibility on successful completion (§4.6 and §8.4).
 
-### 4.6 render-route-audio
+### 4.6 Audio Render Job (pg_boss queue + scheduled worker)
 
-**Caller:** dashboard (after a successful `replace_route_with_stops` call), called asynchronously
-**Purpose:** render route-specific audio files server-side and store them in Supabase Storage
-**Type:** Edge Function (not a Postgres RPC — requires calling an external TTS API)
+Audio rendering runs as a **pg_boss-backed job**, not as a synchronously-invoked Edge Function.
+This section specifies the queue, the enqueue path, the worker, and the per-job processing
+algorithm. The job replaces the previous `render-route-audio` Edge Function (removed in v3.8);
+the *output* is unchanged (pre-rendered MP3 files in Supabase Storage) but the production
+mechanism is asynchronous, retryable, idempotent, and observable.
 
-**Input:** `{ route_id: string }`
+**Why pg_boss.** A Postgres-backed job queue gives us durability, retry, and backoff with no
+new infrastructure: pg_boss creates its own tables inside the existing Supabase Postgres
+database. There is no separate queue service to deploy or pay for. The trade-off — the worker
+runs as a scheduled Edge Function rather than a long-running consumer — is acceptable for the
+initial release's expected queue depth (a single operator may save a handful of routes per
+week; even at 100 operators that is tens of jobs per day).
+
+#### Installation and configuration
+
+- pg_boss is installed by running `await boss.start()` once from a one-off bootstrap Edge
+  Function (`pgboss-install`). This creates the `pgboss` schema and the tables
+  `pgboss.job`, `pgboss.archive`, `pgboss.schedule`, `pgboss.subscription`, `pgboss.version`.
+  We do not define a custom job table — pg_boss owns its schema and handles its own internal
+  migrations across library upgrades.
+- Queue name: `render-route-audio`.
+- Retry policy: `retryLimit: 5`, `retryDelay: 30` (seconds), `retryBackoff: true`. pg_boss's
+  native exponential backoff yields retries at approximately 30s, 60s, 120s, 240s, 480s
+  after the previous failure.
+- Job retention: `retentionDays: 7` (completed and terminally-failed jobs archive after 7 days).
+
+#### Enqueue path: `enqueue-render-job` Edge Function
+
+**Caller:** dashboard (after a successful `replace_route_with_stops`).
+**Purpose:** push a job onto the `render-route-audio` pg_boss queue.
+
+**Input:** `{ route_id: string, route_version: number }` where `route_version` is the freshly
+stamped `routes.updated_at` expressed as epoch millis (the dashboard reads this back from the
+`replace_route_with_stops` response).
 
 **Behaviour:**
-1. Read the route row and all route_stops for `route_id` from Supabase, ordered by `stop_order`.
-2. Resolve the operator_id from the route row (for the Storage path).
-3. Call a server-side TTS API (e.g., Google Cloud Text-to-Speech, Amazon Polly) with a single
-   configured voice to render:
-   - The route announcement text: "This bus is the [route.name] service to [last_stop.stop_name]."
-   - For each stop N: the next-stop text: "Next stop: [stop.stop_name]."
-4. Write each rendered MP3 to the `route-audio` bucket at
-   `{operator_id}/{route_id}/route_announcement.mp3` and
-   `{operator_id}/{route_id}/stop_{stop_order}.mp3`. Overwrite any existing files.
-5. Return `{ files_written: number }`.
+1. Verify caller's JWT and resolve to an operator via the `operator_id` claim. Confirm the
+   route belongs to that operator (RLS-protected SELECT on `routes`).
+2. Connect to pg_boss via the Supabase Postgres connection (`SUPABASE_DB_URL`).
+3. Call `boss.send('render-route-audio', { route_id, route_version })`.
+4. Return `{ job_id }`.
 
-**Error handling:** If the TTS API call or Storage write fails, the function returns an error.
-The dashboard may log this but does not surface it to the operator as a blocking error — the route
-is already saved. The route will show as "Audio not ready" on tablets until a subsequent render
-succeeds. A retry mechanism (manual re-save of the route, or an admin-triggered re-render) resolves
-transient failures.
+Direct client-side enqueue is avoided because pg_boss writes require Postgres credentials that
+must not be exposed to the browser. `enqueue-render-job` is deliberately thin — it does not
+read the route data itself; that is the worker's job.
 
-**Fixed announcements are not rendered here.** Termination, hail-and-ride start/end, diversion
-start/end, and the alert chime are bundled in the APK and do not vary by route. This function
-renders only the route-specific files.
+The dashboard also offers a "Re-render audio" action per route (PRD FR-WD-21) which calls
+`enqueue-render-job` with the route's current `updated_at` as `route_version` — useful for
+recovering from terminal failures without modifying route data.
+
+#### Worker: `audio-render-worker` Edge Function
+
+A Supabase Edge Function invoked **every minute** by Supabase scheduled functions
+(`cron: '* * * * *'`). Each invocation does:
+
+1. Connect to pg_boss using `SUPABASE_DB_URL`.
+2. `boss.fetch('render-route-audio', batchSize)` — pull up to `batchSize = 5` ready jobs.
+3. Process each fetched job synchronously within the invocation (see "Per-job processing"
+   below).
+4. On per-job success: `boss.complete(jobId)`. On per-job failure: `boss.fail(jobId, err)` —
+   pg_boss schedules the retry with backoff.
+5. Edge Function execution time on Supabase is bounded (typically 60s for hosted). The worker
+   exits when 50s have elapsed in the current invocation even if jobs remain — those jobs
+   stay in the queue and are picked up by the next scheduled run. The 10s safety margin
+   allows in-flight `boss.complete` / `boss.fail` calls to commit cleanly.
+
+The scheduled-function worker is the simpler initial implementation. If queue depth grows to
+the point that one-minute-granularity polling and batch-of-5 throughput become a bottleneck,
+the worker can be promoted to a dedicated long-running consumer (e.g., a Fly.io machine) with
+no change to the queue, the job payload, or the per-job processing algorithm. The current
+design defers that complexity until it is justified by load.
+
+#### Per-job processing
+
+**Job payload:** `{ route_id: string, route_version: number }`.
+
+1. **Staleness check.** Load the `routes` row by `route_id`. If `extract(epoch from
+   routes.updated_at) * 1000 ≠ route_version`, a newer save has happened since this job was
+   enqueued. Mark the job complete (`boss.complete`) without rendering — the newer save has
+   enqueued its own job which will produce the correct audio. This prevents wasted Google TTS
+   spend on superseded versions.
+2. Load all `route_stops` rows for `route_id`, ordered by `stop_order`.
+3. Resolve `operator_id` from the route row (for Storage paths).
+4. Compute the announcement text:
+   `"This bus is the [route.name] service to [last_stop.stop_name]."`. Compute its SHA-256 hex
+   hash as `would_be_announcement_hash`.
+5. For each stop, compute the per-stop text `"Next stop: [stop.stop_name]."` and its SHA-256
+   hex as that stop's `would_be_content_hash`.
+6. **Differential re-render check (announcement and each stop):**
+   - Define `target_path = {operator_id}/{route_id}/{route_version}/<file>.mp3`.
+   - If the stored hash on the database row (`routes.audio_announcement_hash` or
+     `route_stops.audio_content_hash`) equals the `would_be_*_hash`, the text is unchanged
+     since the last successful render. The worker does **not** call Google TTS.
+   - The worker then checks Storage for the file at `target_path`. If present, nothing to do.
+     If absent (the typical case — this is a new `route_version` and the version path is
+     fresh), the worker locates the file at the **previous version's path** (the most-recent
+     `route_version' < route_version` for this route that contains a file matching the same
+     hash) and uses Storage's server-side `copy` to place a copy at `target_path`. This makes
+     a direction-label-only edit (which changes nothing about any announcement text)
+     genuinely free of TTS cost — the worker only copies files.
+   - If no previous-version file exists with a matching hash, fall through to the render path.
+7. **Render path (for any announcement or stop whose hash changed or has no copyable prior):**
+   - Call Google Cloud Text-to-Speech `synthesizeSpeech` with:
+     - `voice: { languageCode: 'en-GB', name: 'en-GB-Neural2-B' }`
+     - `audioConfig: { audioEncoding: 'MP3', sampleRateHertz: 22050 }`
+   - **The voice is locked to `en-GB-Neural2-B`.** It is not configurable per operator, per
+     route, or per deployment. Changing the voice requires re-running the Reg 13(4)
+     frequency verification (Compliance Mapping Matrix) and is therefore a deliberate
+     re-planning event, not a runtime knob. This is an inviolable rule alongside the
+     alert-chime sequence.
+   - Upload the resulting MP3 bytes to Storage at `target_path` using the service-role
+     Supabase client.
+   - On a successful upload, update the corresponding hash column atomically in a single
+     SQL statement:
+     - For the announcement: `UPDATE routes SET audio_announcement_hash = $1 WHERE id = $2`.
+     - For a stop: `UPDATE route_stops SET audio_content_hash = $1 WHERE id = $2`.
+8. **Partial-failure semantics.** The worker processes the announcement and stops
+   sequentially. If any single step fails (TTS API error, Storage upload error, transient
+   network error), the worker calls `boss.fail(jobId, err)`; pg_boss schedules a retry per the
+   backoff policy. **Already-completed steps are durable**: their Storage files and updated
+   hash columns persist across the retry. On retry, the differential re-render check (step 6)
+   short-circuits every step that already succeeded, so processing resumes at the failed
+   step. There is no explicit "where did we stop" cursor — the content-hash bookkeeping is
+   the resumption mechanism.
+9. **Terminal failure.** After `retryLimit` retries (5) are exhausted, pg_boss marks the job
+   permanently failed. The worker's failure handler runs and:
+   - `UPDATE routes SET audio_render_status = 'failed', audio_render_error = $err_message
+     WHERE id = $route_id`. The error message captured is the last failure detail (truncated
+     to a reasonable length).
+   - **Does not fire FCM.** Tablets are not notified of a failure. The route's
+     `audio_render_status` reaches tablets on their next regular sync (the column rides along
+     in the `get_routes_since` response, §4.5) and the tablet skips audio download for that
+     route (§7.4). The "Audio not ready" indicator on the tablet (§6.4) continues to gate
+     journey starts.
+   - The dashboard surfaces the failure on the route list (PRD FR-WD-13) with a "Re-render
+     audio" action (PRD FR-WD-21) to re-enqueue.
+10. **On successful completion of the whole job** (announcement + all stops either rendered,
+    skipped-by-hash, or copied-from-previous-version):
+    - `UPDATE routes SET audio_render_status = 'ok', audio_render_error = NULL WHERE
+      id = $route_id`.
+    - **Fire FCM push** by calling the route-change FCM dispatcher (§7.6) for this operator's
+      active devices. This is the only path that fires FCM. The render-then-FCM ordering
+      guarantees that any tablet receiving the push will find both the route data and the
+      version-keyed audio files available for download.
+
+#### Fixed announcements are not rendered here
+
+Termination, hail-and-ride start/end, diversion start/end, and the alert chime are bundled in
+the APK (§6.3) and do not vary by route. The audio-render-worker only renders route-specific
+files. The bundled files are rendered once during development using the **same locked voice
+(`en-GB-Neural2-B`)** and shipped in the APK to ensure voice consistency between fixed and
+route-specific audio.
+
+#### Cost discipline
+
+- Google TTS Neural2 voice pricing is approximately $16 per 1M characters (as of late 2025).
+- A 10-stop route is ~250 characters of TTS input; a full first-time render costs ~$0.004.
+- Editing one stop name re-renders one file (~25 characters) for ~$0.0004; the
+  differential hash check ensures unchanged stops cost nothing.
+- The 5-retry cap with backoff bounds the worst-case per-job retry cost.
+- The differential hash check + previous-version copy together ensure that a direction-label
+  edit, which changes no announcement text, calls Google TTS zero times.
+- No explicit cost tracking surface is required for the initial release; the Google Cloud
+  billing dashboard and pg_boss queue depth provide adequate visibility.
+
+### 4.7 Storage Cleanup Job (audio-cleanup-worker)
+
+A separate scheduled Edge Function `audio-cleanup-worker` runs daily (`cron: '0 3 * * *'`,
+03:00 UTC). For each route in the database:
+
+1. List Storage entries under `{operator_id}/{route_id}/`. Each immediate child folder is a
+   `route_version`.
+2. Sort versions descending (largest epoch-millis first).
+3. Keep the **two most-recent** versions. Recursively delete every older version path.
+
+**Why two versions, not one.** Two-version retention gives a tablet a recovery window if it
+synced the route metadata just before a new save: the previous version's audio files are
+still available for download, so a tablet that pulled the metadata for version N-1 between
+when N was saved and when N's render completes can still successfully download version N-1's
+audio. One-version retention would risk a 404 in that race window.
+
+The cleanup job is idempotent — running it more than once a day is harmless because each run
+recomputes the keep-set independently. Failure within a day is logged but not retried inside
+the same day; the next day's run picks up the missed work.
+
+Hard-deletion of a route (data retention cleanup, §10) overrides this policy and removes all
+versions for that route.
 
 ### 4.5 get_routes_since
 
@@ -610,8 +805,9 @@ Local mirror of the operator's routes from Supabase.
 | route_number | TEXT | NULLABLE | Optional route number |
 | direction | TEXT | NULLABLE | Direction label |
 | return_route_id | TEXT | NULLABLE | Links to return route |
-| updated_at_utc | LONG | NOT NULL | Epoch millis of server timestamp |
+| updated_at_utc | LONG | NOT NULL | Epoch millis of server timestamp. Also used as the `route_version` path segment for audio downloads (§7.2 step 7, §2.7). |
 | is_deleted | BOOLEAN | NOT NULL | Soft delete flag from Supabase. When true, hidden from route list. |
+| audio_render_status | TEXT | NOT NULL, DEFAULT 'pending' | Mirror of `routes.audio_render_status` from Supabase (`pending` / `ok` / `failed`). Read by the audio-download step (§7.4) — only `ok` routes attempt to download audio. Read by the journey-start gate (§6.4) which requires `ok` AND all files present locally. |
 | pending_deletion | BOOLEAN | NOT NULL, DEFAULT false | Local-only: true if sync pulled a remotely deleted route that is currently active in a journey. Route stays usable for that journey but hidden from the route list. Cleanup sets is_deleted = true when the journey ends. |
 | last_used_at | LONG | NULLABLE | Local-only: epoch millis of last journey start with this route. Used for sorting. Not synced. |
 
@@ -739,33 +935,49 @@ system, separate from Room and SharedPreferences.
 
 **Root path:** `{context.filesDir}/audio/`
 
-**File layout:**
+**File layout (version-keyed):**
 ```
 audio/
   {operator_id}/
     {route_id}/
-      route_announcement.mp3
-      stop_0.mp3
-      stop_1.mp3
-      ...
-      stop_N.mp3
+      {route_version}/
+        route_announcement.mp3
+        stop_0.mp3
+        stop_1.mp3
+        ...
+        stop_N.mp3
 ```
+
+`{route_version}` matches the version segment in the Storage path scheme (§2.7) and is the
+route's `updated_at` in epoch millis. The tablet holds exactly one version per route at any
+given time — when a new version is downloaded successfully, the previous version's
+directory is removed.
 
 **Bundled assets** (termination, H&R, diversion, alert chime, keepalive) remain in APK
 `res/raw/`; they are not duplicated in `filesDir`.
 
-**Journey-start gating:** Before enabling the "Start Journey" button for a route, the app checks
-whether all expected audio files exist in `filesDir`. Expected files are derived from the route's
-stop count (one `route_announcement.mp3` + one `stop_{N}.mp3` per stop). If any file is absent,
-the route shows a "Audio not ready — syncing" indicator and cannot be started. This is a clear
-error state; there is no fallback to on-device TTS.
+**Journey-start gating:** Before enabling the "Start Journey" button for a route, the app
+checks **both**:
+1. The Room `routes.audio_render_status` for that route is `'ok'`. If it is `pending` or
+   `failed`, the gate is closed regardless of file presence.
+2. All expected audio files exist in `filesDir` under the current `{route_version}` directory.
+   Expected files are derived from the route's stop count (one `route_announcement.mp3` +
+   one `stop_{N}.mp3` per stop).
 
-**Cleanup:** When a route's `is_deleted = true` is applied locally (during sync or at journey
-end for pending-deletion routes), the app deletes the corresponding `{route_id}/` directory
-from local audio storage. This prevents audio files from accumulating for deleted routes.
+If either check fails, the route shows an "Audio not ready — syncing" indicator and cannot
+be started. This is a clear error state; there is no fallback to on-device TTS.
 
-**No Room schema change:** Audio file presence is determined by file-system stat at runtime.
-No audio-file metadata table is needed.
+**Cleanup:**
+- When a route's `is_deleted = true` is applied locally (during sync or at journey end for
+  pending-deletion routes), the app deletes the corresponding `{route_id}/` directory and
+  all its version subdirectories.
+- When a new `{route_version}` is downloaded successfully for an existing route, older
+  `{route_version}` directories for that route are removed.
+
+**No Room schema change for audio files:** Audio file presence is determined by file-system
+stat at runtime. No audio-file metadata table is needed. The `routes.audio_render_status`
+column added to Room (§5.1) captures only the server-side render outcome, not local file
+presence.
 
 ---
 
@@ -791,11 +1003,13 @@ Note: the heartbeat (§7.7) is a separate mechanism from route sync. It updates 
 4. For each non-deleted returned route, replace its stops in Room: delete all local route_stops for that route_id, then insert the complete set from the RPC response. This is safe because no local tables have foreign key references to route_stop IDs.
 5. Update `sync_metadata.last_server_timestamp` to the `server_now` returned by the RPC.
 6. Update `sync_metadata.last_sync_at` and set `sync_status = 'synced'`.
-7. **Download audio files (new):** For each route UPSERT'd in step 3 (not deleted), download any missing or outdated audio files from Supabase Storage to local file storage (§6.4):
-   - Compute expected file list: `route_announcement.mp3` + `stop_{N}.mp3` for each stop (N = 0 to stop_count − 1).
-   - If the route was updated in this sync (i.e., it appears in the `get_routes_since` response), re-download all audio files for that route, overwriting any existing local files. This handles stop renames and route name changes.
-   - If a file is new (did not exist locally), download it.
-   - Audio download failures are non-fatal: log `AUDIO_FILE_MISSING` to journey_events, continue sync. The route will show "Audio not ready" until the next successful download.
+7. **Download audio files (version-keyed):** For each route UPSERT'd in step 3 (not deleted), download audio files from Supabase Storage to local file storage (§6.4) using the route's version-keyed path scheme (§2.7):
+   - **Render-status guard.** If the route's `audio_render_status = 'failed'`, do **not** attempt any audio download for it — the version-keyed path will not exist in Storage and the request would 404. Log `AUDIO_FILE_MISSING` once with `detail = 'render_failed'` and move on. The "Audio not ready" indicator (§6.4) continues to gate journey starts. If `audio_render_status = 'pending'`, also defer download — a future sync (after the render worker completes) will see `ok`.
+   - **For routes with `audio_render_status = 'ok'`:** compute `route_version` as the route's `updated_at` in epoch millis. The expected file list is `route_announcement.mp3` plus `stop_{N}.mp3` for each stop, all under `{operator_id}/{route_id}/{route_version}/`.
+   - If the route was updated in this sync (it appears in the `get_routes_since` response), the path's `route_version` segment has changed; download all audio files for the new version into a fresh local `{route_id}/{route_version}/` directory (see §6.4 layout note). The previous local version directory is removed once the new download completes successfully.
+   - If a file is missing locally for the current version, download it.
+   - The tablet pulls audio for the specific route version it just synced; older or newer Storage versions are not pulled. If the dashboard saves the route again while the tablet is mid-download, the tablet completes its download of the version it asked for; the next sync round picks up the newer version.
+   - Audio download failures (network drop, 404 on a partially-rendered version) are non-fatal: log `AUDIO_FILE_MISSING` to journey_events, continue sync. The route shows "Audio not ready" until the next successful download.
 8. Update the device's `last_seen_at` in Supabase (separate query).
 
 ### 7.4 Sync Algorithm — Full Sequence
@@ -804,8 +1018,8 @@ Note: the heartbeat (§7.7) is a separate mechanism from route sync. It updates 
 2. Check operator account status by querying the `operators` row. Abort sync if `status != 'active'`:
    - `status = 'pending'`: display "Account pending approval — contact your administrator" and abort.
    - `status = 'suspended'`: display "Account Suspended — please contact your bus company administrator" and abort.
-3. **Download** remote route and stop changes per section 7.2 steps 1–6.
-4. **Download audio files** per section 7.2 step 7. Audio download runs after route data is committed to Room. Audio failures do not fail the sync — routes are updated even if audio files are temporarily unavailable.
+3. **Download** remote route and stop changes per section 7.2 steps 1–6. The route rows pulled by `get_routes_since` carry the new `audio_render_status` and `audio_render_error` columns (§2.4); these are written into the local Room `routes` mirror (§5.1) and used by the audio-download step below.
+4. **Download audio files** per section 7.2 step 7, using version-keyed paths derived from each route's `updated_at` and skipping any route whose `audio_render_status` is `failed` or `pending`. Audio download runs after route data is committed to Room. Audio failures do not fail the sync — routes are updated even if audio files are temporarily unavailable.
 5. Set `sync_metadata.sync_status = 'synced'`.
 6. Update `devices.active_route_id` if a journey is in progress.
 7. On any failure in steps 1–3 or 5, set `sync_status = 'failed'` and retry on next trigger. Audio download failure (step 4) is logged but does not set `sync_status = 'failed'`.
@@ -816,14 +1030,35 @@ In the initial release, conflicts cannot occur because tablets are read-only for
 
 ### 7.6 FCM Push Notifications
 
-When a route is inserted, updated, or deleted on Supabase, a database trigger calls a Supabase Edge Function that:
-1. Identifies the operator_id from the changed route.
-2. Queries `devices` for all active devices belonging to that operator.
-3. Sends an FCM message to each device's FCM token, with a simple payload signalling "routes have changed."
+**Dispatch point.** Route-change FCM push is fired by the **`audio-render-worker`** on
+successful job completion (§4.6 per-job step 10), **not** by a routes-table trigger and
+**not** by the dashboard at save time. This is the render-then-FCM ordering: a push fires
+only after the route's audio is available in Storage, guaranteeing that a tablet which syncs
+in response to the push will find both the route data and the version-keyed audio ready to
+download. A render that ends in terminal failure does **not** fire FCM; the failed status
+reaches tablets only on their next regular sync trigger.
 
-Tablets register their FCM registration token in `devices.fcm_token` (see §2.2) during the first successful sync after pairing. The token is re-registered whenever Firebase rotates it. On receiving an FCM message, the tablet triggers an immediate sync.
+**Dispatcher.** The dispatcher itself is a small server-side function (callable by the worker
+via service-role HTTP) that:
+1. Takes a `route_id` as input.
+2. Queries `routes` to resolve `operator_id`.
+3. Queries `devices` for all active devices belonging to that operator with a non-null
+   `fcm_token`.
+4. Sends an FCM message to each device's FCM token with a simple payload signalling "routes
+   have changed."
 
-FCM is the mechanism that enables sub-5-minute route propagation (PRD §12 success metric) for tablets that are already online. If FCM is unavailable (device offline, FCM service down), the connectivity-change and 30-minute periodic triggers ensure eventual consistency — propagation may take up to 30 minutes in the worst case.
+The dispatcher shape is unchanged from earlier versions; only the call site has moved (from
+a DB trigger on `routes.updated_at` to the audio render worker's success branch).
+
+Tablets register their FCM registration token in `devices.fcm_token` (see §2.2) during the
+first successful sync after pairing. The token is re-registered whenever Firebase rotates it.
+On receiving an FCM message, the tablet triggers an immediate sync.
+
+FCM is the mechanism that enables sub-5-minute route propagation **from successful render**
+(PRD §12 success metric — note that the metric now starts the clock at render completion,
+not at dashboard save, because FCM no longer fires at save). If FCM is unavailable (device
+offline, FCM service down), the connectivity-change and 30-minute periodic triggers ensure
+eventual consistency — propagation may take up to 30 minutes in the worst case.
 
 ### 7.7 Heartbeat Mechanism
 
@@ -954,31 +1189,59 @@ The heartbeat is a lightweight periodic update that keeps `devices.last_seen_at`
        |                   |--------- Emit StateFlow update ---------->|
        |                   |                       |-- Update tube-map: N shown with strikethrough
 
-### 8.4 Route Sync Flow
+### 8.4 Route Sync Flow (render-then-FCM)
 
-    Dashboard      Supabase / Storage   render-route-audio    FCM            Tablet
-       |                  |                    |               |               |
-       |-- Save route --->|                    |               |               |
-       |                  |-- replace_route_with_stops         |               |
-       |                  |-- Trigger: routes.updated_at       |               |
-       |                  |-- Trigger: notify FCM              |               |
-       |                  |--------------------------------->  |               |
-       |                  |   [async] --> render-route-audio --+               |
-       |                  |                    |-- Render route_announcement.mp3
-       |                  |                    |-- Render stop_N.mp3 (per stop)
-       |                  |                    |-- Write to route-audio bucket  |
-       |                  |                                    |               |
-       |                  |                               |----|               |
-       |                  |                               |--> Push to device tokens
-       |                  |                                                    |
-       |                  |<-- get_routes_since(last_ts) ----------------------|
-       |                  |--------- Return changed routes -------------------->
-       |                                                                       |-- UPSERT routes
-       |                                                                       |-- Replace route_stops
-       |                                                                       |-- Update last_server_timestamp
-       |                  |<-- Storage: fetch audio files ---------------------|
-       |                  |--------- Stream MP3 files ------------------------->
-       |                                                                       |-- Store in filesDir/audio/
+    Dashboard      Supabase / Storage      pg_boss        audio-render-worker        FCM            Tablet
+       |                  |                  |              (scheduled, 1 min)        |               |
+       |                  |                  |                                        |               |
+       |-- Save route --->|                  |                                        |               |
+       |                  |-- replace_route_with_stops                                |               |
+       |                  |   routes.updated_at stamped (= route_version)             |               |
+       |                  |   audio_render_status = 'pending'                         |               |
+       |                  |                                                           |               |
+       |-- enqueue-render-job(route_id, route_version) -->|                           |               |
+       |                  |                  |-- boss.send                            |               |
+       |<-- {job_id} -----|                  |                                        |               |
+       |                  |                  |                                        |               |
+       |                  |                  |   [every minute]                       |               |
+       |                  |                  |<--------- boss.fetch ------------------|               |
+       |                  |                  |---------- job batch ------------------>|               |
+       |                  |                                                           |               |
+       |                  |                              [Per-job processing:]                        |
+       |                  |                              Staleness check: routes.updated_at == route_version?
+       |                  |                              Compute would-be hashes for announcement + each stop
+       |                  |                              For each: hash matches stored? && file at target path?
+       |                  |                                  yes → skip (no-op)
+       |                  |                                  hash matches but no file at new version path →
+       |                  |<-- Storage server-side copy from prev version ------------|               |
+       |                  |                                  hash differs or no prior version →
+       |                  |                              Google TTS synthesize (en-GB-Neural2-B) ----> Google Cloud
+       |                  |<-- Storage PUT at {operator_id}/{route_id}/{route_version}/...mp3 --------|
+       |                  |    UPDATE route_stops.audio_content_hash                  |               |
+       |                  |    UPDATE routes.audio_announcement_hash                  |               |
+       |                  |                  |                                                        |
+       |                  |                  |-- boss.complete (per job)                              |
+       |                  |    UPDATE routes.audio_render_status = 'ok'                               |
+       |                  |                  |                                                        |
+       |                  |                                                            FCM dispatch -->|
+       |                  |                                                                           |
+       |                  |                                                                  [Sync triggered]
+       |                  |<-- get_routes_since(last_ts) -------------------------------------------- |
+       |                  |--- routes (incl. audio_render_status='ok', route_version=updated_at) --->|
+       |                                                                                             |-- UPSERT routes (incl. status)
+       |                                                                                             |-- Replace route_stops
+       |                                                                                             |-- Update last_server_timestamp
+       |                  |                                                                          |
+       |                  |<-- Storage GET {operator_id}/{route_id}/{route_version}/*.mp3 -----------|
+       |                  |--- Stream MP3 files -------------------------------------------------->  |
+       |                                                                                             |-- Store in filesDir/audio/{operator_id}/{route_id}/{route_version}/
+
+    Failure branch (terminal, after pg_boss retries exhausted):
+       |                  |   UPDATE routes SET audio_render_status='failed', audio_render_error=$msg
+       |                  |   (FCM is NOT fired)
+       |                  |   Failure surfaces on dashboard route list (FR-WD-13);
+       |                  |   "Re-render audio" action (FR-WD-21) re-enqueues.
+       |                  |   Tablets see the 'failed' status on their next regular sync and skip audio download.
 
 ### 8.5 Heartbeat Flow
 
@@ -1031,9 +1294,11 @@ The heartbeat is a lightweight periodic update that keeps `devices.last_seen_at`
 |---|---|---|
 | Journey events (local) | 30 days | Auto-deleted on app startup |
 | Used/expired pairing codes | 1 hour | Scheduled cleanup function in Supabase |
-| Soft-deleted routes | Indefinite in Supabase | Could be hard-deleted after 90 days (operations decision) |
+| Soft-deleted routes | Indefinite in Supabase | Could be hard-deleted after 90 days (operations decision); hard-deletion removes all audio versions for the route from Storage |
 | Journey state (local) | Cleared on journey end | is_active = false when journey completes; pending_deletion cleanup runs here too |
 | Inactive devices | Indefinite in Supabase | Could be auto-deregistered after extended inactivity (operations decision) |
+| Route audio (Storage) | Two most-recent versions per route | Daily `audio-cleanup-worker` (§4.7) at 03:00 UTC; older `{route_version}` paths removed |
+| pg_boss jobs | 7 days after completion or terminal failure | `retentionDays: 7` on the `render-route-audio` queue (§4.6); pg_boss archives to `pgboss.archive` then prunes |
 
 ---
 
@@ -1054,17 +1319,70 @@ A few non-obvious points worth capturing here so they're not lost:
 **Sync cursor uses server transaction time, not max(updated_at).** The `get_routes_since` RPC returns `current_timestamp` from its transaction as the cursor, not the maximum `updated_at` from its result set. This prevents the device re-downloading rows that were updated during the read.
 
 **Audio file presence gating.** Before enabling the "Start Journey" button for a route, the app
-calls `File.exists()` on each expected audio file (one route announcement + one per stop). If any
-file is missing, the route renders with an "Audio not ready — syncing" indicator and the button is
-disabled. This is the only error state for missing audio; there is no fallback to on-device TTS.
-On-device TTS is not used anywhere in this product.
+checks two things: (1) the Room `routes.audio_render_status` is `'ok'`, and (2) `File.exists()`
+on each expected audio file under the current `{route_version}` directory. If either check
+fails, the route renders with an "Audio not ready — syncing" (or "Audio render failed" if
+status is `failed`) indicator and the button is disabled. There is no fallback to on-device
+TTS. On-device TTS is not used anywhere in this product.
 
-**Audio file outdating.** When a route appears in the `get_routes_since` response (i.e., it was
-updated since the last sync), all audio files for that route are re-downloaded regardless of
-whether they already exist locally. This handles stop renames and route name changes without
-requiring a separate audio-version tracking field — the route's own `updated_at` serves as the
-version signal.
+**Differential re-rendering via content hashes.** Each route's `routes.audio_announcement_hash`
+and each stop's `route_stops.audio_content_hash` capture the SHA-256 of the text most recently
+rendered to the corresponding MP3 file. On re-render, the audio render worker (§4.6) computes
+the would-be hashes for the current text, compares against the stored hashes, and only
+renders stops whose hash has changed. Unchanged audio is server-side-copied from the previous
+version's Storage path into the new version's path, so a direction-label-only edit (which
+changes no announcement text) calls Google TTS zero times.
 
-**Audio download is non-fatal.** A failed audio file download does not set `sync_status = 'failed'`
-and does not prevent the route data from being written to Room. The route is usable once audio
-files are present; the "Audio not ready" indicator disappears after the next successful download.
+**Version-keyed Storage paths.** Each route save produces a new `{route_version}` path prefix
+(`routes.updated_at` in epoch millis). Tablets pull audio for the exact route version they
+synced; older versions remain in Storage for a recovery window of two versions (cleanup
+policy in §4.7). This makes concurrent saves race-safe by construction — two saves cannot
+collide on the same path.
+
+**Voice is locked.** Google Cloud TTS voice `en-GB-Neural2-B` is fixed in code; it is not a
+runtime configurable. Changing the voice is a deliberate compliance event — Reg 13(4)
+frequency verification (Compliance Mapping Matrix) must be re-run before any new voice ships.
+Treat the locked voice as an inviolable architectural rule alongside the alert-chime
+sequence.
+
+**pg_boss owns its schema.** The `pgboss` schema is managed entirely by the pg_boss library;
+do not write application tables in it, do not migrate it manually, and do not couple
+application code to specific pg_boss internal table shapes — pg_boss handles its own schema
+versioning across library upgrades.
+
+**Audio download is non-fatal.** A failed audio file download does not set `sync_status =
+'failed'` and does not prevent the route data from being written to Room. The route is
+usable once audio files are present and `audio_render_status = 'ok'`; the "Audio not ready"
+indicator disappears after the next successful download.
+
+---
+
+## 12. Environment Variables and Secrets
+
+Server-side secrets are managed as **Supabase Edge Function secrets**, set via
+`supabase secrets set NAME=value`. They are injected into every Edge Function's environment
+at invocation time.
+
+| Variable | Used by | Purpose |
+|---|---|---|
+| `SUPABASE_URL` | All Edge Functions, dashboard | Project URL (built-in for Edge Functions). |
+| `SUPABASE_ANON_KEY` | Dashboard, tablet | Anonymous client key. Tablet uses this for `pair-device` and `recover-device` calls before it has a session. |
+| `SUPABASE_SERVICE_ROLE_KEY` | All Edge Functions | Bypasses RLS. Required by `pair-device`, `recover-device`, `generate-pairing-code`, `enqueue-render-job`, `audio-render-worker`, `audio-cleanup-worker`, `retry-admin-notification`. |
+| `SUPABASE_DB_URL` | `enqueue-render-job`, `audio-render-worker`, `audio-cleanup-worker` | Postgres connection string. pg_boss requires a direct DB connection. Built-in for Edge Functions. |
+| `GOOGLE_TTS_API_KEY` | `audio-render-worker` | Google Cloud Text-to-Speech API key. Created in the system administrator's GCP project. Restrict the key to the Text-to-Speech API only. Required for all `synthesizeSpeech` calls in §4.6. |
+| `FCM_SERVER_KEY` | Route-change FCM dispatcher (called from `audio-render-worker`) | Firebase Cloud Messaging server credential used to send push notifications to operator devices. |
+| `ADMIN_EMAIL` | Signup trigger / `retry-admin-notification` | Destination for new-operator signup notifications (§3.1). |
+
+**Setup checklist** (one-off, performed by the system administrator before the first
+deployment):
+
+1. Create a Google Cloud project; enable the Cloud Text-to-Speech API; create an API key;
+   restrict it to the Text-to-Speech API. Store as `GOOGLE_TTS_API_KEY` via
+   `supabase secrets set`.
+2. Configure FCM credentials (server key) per existing setup; store as `FCM_SERVER_KEY`.
+3. Run the one-off `pgboss-install` Edge Function to create the `pgboss` schema and tables.
+4. Schedule `audio-render-worker` (`* * * * *`) and `audio-cleanup-worker` (`0 3 * * *`) via
+   Supabase's scheduled functions.
+5. Complete the Reg 13(4) voice-frequency verification described in the Compliance Mapping
+   Matrix and record the result in the operations runbook before serving any production
+   traffic.
