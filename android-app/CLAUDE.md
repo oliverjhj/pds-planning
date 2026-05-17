@@ -1,14 +1,17 @@
 # CLAUDE.md
 # Passenger Display System (PDS) — Android Application
 
-**Version:** 3.8 (May 2026)
+**Version:** 3.9 (May 2026)
 
 This file is your reference for working on the PDS Android application. Read it at the start of every session. It contains conventions, architectural rules, and known gotchas. If a rule here conflicts with a prompt, ask before deviating.
 
 ## Changelog
 
+### v3.9 (May 2026)
+Round-3 post-adversarial-review close-out sweep. Applies the per-prompt CLAUDE.md impact lists produced by round-3 Tasks 2 and 3. Substantive deltas — itemised in the v3.9 sweep summary at the end of this file — include: audio file format switched MP3 → **LINEAR16 WAV** end-to-end (file tree, Rule 9, Rule 10, Rule 11, Rule 12, gotchas); Reg 13(4) frequency-range now empirically verified (no longer a pre-deployment blocker); Rule 17 Sentry PII clarified — `device_id` is a permitted diagnostic UUID breadcrumb, not a banned identifier; FR-AT-50 credential wipe now explicitly enumerates JWT + refresh token + device secret (parity with FR-AT-04 terminal recovery); compound 60-day auto-deregistration (silence AND ≥5 failed recover-device attempts) replaces the simple silence threshold; new gotcha — local `audio_enabled` lives in the Room `device_state` table (§5.9 Data-Arch), not SharedPreferences; new gotcha — `journey_state.diversion_invoked_at_any_point` is a one-way latch reset only on a new journey; FR-AT-28 audio-not-ready screen now shows the "Contact your fleet manager…" driver hint.
+
 ### v3.8 (May 2026)
-Previously unversioned. Brought into sync with the v3.8 planning suite via the round-2 close-out sweep. Reflects all round-1 (PRD/Data-Arch/Compliance v3.0 → v3.7) and round-2 (v3.7 → v3.8) decisions that had never propagated into CLAUDE.md. Substantive deltas — itemised in "Sweep summary" at the end of this file — include: bundled tablet NaPTAN removed; upload-sync scaffolding removed; Kiosk Level 2 deferred (Level 1 is the initial release); on-device TTS forbidden, pre-rendered MP3 pipeline documented; per-stop proximity radius + two-stop look-ahead + GPS accuracy gate; `audio_render_status` journey-start gate; per-device `audio_enabled` with honest one-per-bus framing; heartbeat moved to lifecycle ownership (`HeartbeatController` + `ProcessLifecycleOwner`); JWT custom-claims contract for RLS; `devices.activation_state` rename; operator-status enum with suspension-at-journey-end; `journey_summaries_pending` outbox; `journey_state` staleness recovery; FR-AT-65 visual flash co-equal with the audio chime; FR-AT-67 GMS detection; FR-AT-04 transient vs terminal recovery; FCM data-only payload; `device_secret` in EncryptedSharedPreferences; manual custom-access-token-hook setup; Sentry crash telemetry.
+Previously unversioned. Brought into sync with the v3.8 planning suite via the round-2 close-out sweep. Reflects all round-1 (PRD/Data-Arch/Compliance v3.0 → v3.7) and round-2 (v3.7 → v3.8) decisions that had never propagated into CLAUDE.md. Substantive deltas — itemised in "Sweep summary" at the end of this file — include: bundled tablet NaPTAN removed; upload-sync scaffolding removed; Kiosk Level 2 deferred (Level 1 is the initial release); on-device TTS forbidden, pre-rendered audio pipeline documented; per-stop proximity radius + two-stop look-ahead + GPS accuracy gate; `audio_render_status` journey-start gate; per-device `audio_enabled` with honest one-per-bus framing; heartbeat moved to lifecycle ownership (`HeartbeatController` + `ProcessLifecycleOwner`); JWT custom-claims contract for RLS; `devices.activation_state` rename; operator-status enum with suspension-at-journey-end; `journey_summaries_pending` outbox; `journey_state` staleness recovery; FR-AT-65 visual flash co-equal with the audio chime; FR-AT-67 GMS detection; FR-AT-04 transient vs terminal recovery; FCM data-only payload; `device_secret` in EncryptedSharedPreferences; manual custom-access-token-hook setup; Sentry crash telemetry.
 
 ---
 
@@ -34,7 +37,7 @@ The product is legally regulated under the UK Public Service Vehicles (Accessibl
 - **Auth:** Supabase Auth (anonymous user per device, created during pairing). JWT carries `operator_id` as a custom claim, stamped by a server-side custom-access-token hook (see Setup Notes and architectural Rule 16).
 - **Push:** Firebase Cloud Messaging — data-only payload `{ type, operator_id, trigger }`. The push never carries content; it is a sync trigger only.
 - **GPS:** FusedLocationProviderClient in a foreground service
-- **Audio:** Android MediaPlayer for pre-rendered MP3 files. Route-specific files are downloaded from Supabase Storage at version-keyed paths (`route-audio/{operator_id}/{route_id}/{route_version}/...`) into `filesDir/audio/`. Fixed announcement files are bundled in the APK under `res/raw/`. **No on-device TTS is used.**
+- **Audio:** Android `MediaPlayer` for pre-rendered **WAV files (LINEAR16 PCM, 24 kHz mono)**. Route-specific files are downloaded from Supabase Storage at version-keyed paths (`route-audio/{operator_id}/{route_id}/{route_version}/...`) into `filesDir/audio/`. Fixed announcement files are bundled in the APK under `res/raw/`. **No on-device TTS is used. No MP3 anywhere in the pipeline** — see Rule 9 and the "Audio is LINEAR16/WAV end-to-end" gotcha.
 - **Kiosk:** Screen pinning (Lock Task Mode Level 1) for the initial release. Lock Task Mode Level 2 (Device Owner mode) is deferred; the architecture is open to it without redesign but it is not in scope to build. See PRD §FR-AT-46.
 - **Background work:** WorkManager for periodic sync fallback and best-effort background heartbeat
 - **Heartbeat:** `HeartbeatController` driven by `ProcessLifecycleOwner` (lifecycle-based, not GPS-service-owned). See Rule 15.
@@ -106,22 +109,23 @@ The target structure is below. Create directories as needed; do not pre-create e
     └── util/                  # Extensions, constants, helpers
 
     app/src/main/res/raw/      # Bundled fixed-announcement audio (see Data-Arch §6.3)
-    ├── alert_chime.mp3
-    ├── silent_keepalive.mp3
-    ├── termination.mp3
-    ├── hail_and_ride_start.mp3
-    ├── hail_and_ride_end.mp3
-    ├── diversion_start.mp3
-    └── diversion_end.mp3
+    ├── alert_chime.wav
+    ├── silent_keepalive.wav
+    ├── termination.wav
+    ├── hail_and_ride_start.wav
+    ├── hail_and_ride_end.wav
+    ├── diversion_start.wav
+    └── diversion_end.wav
 
     # Runtime-resolved audio (not in the source tree — created in app's internal files dir):
     # {context.filesDir}/audio/{operator_id}/{route_id}/{route_version}/
-    #     ├── route_announcement.mp3
-    #     ├── stop_0.mp3
-    #     ├── stop_1.mp3
+    #     ├── route_announcement.wav
+    #     ├── stop_0.wav
+    #     ├── stop_1.wav
     #     └── ...
     # route_version = routes.updated_at as epoch millis. Exactly one version per route at a
-    # time; older versions are removed on successful download of a new version.
+    # time; older versions are removed on successful download of a new version. All audio is
+    # LINEAR16 PCM, 24 kHz mono — see Rule 9.
 
     docs/                      # Frozen reference documents (DO NOT READ)
     ├── PRD.md
@@ -216,11 +220,11 @@ If you find yourself setting `updated_at` from Kotlin code on an outgoing route,
 
 ### 9. [Audio] Pre-rendered audio playback only — no on-device TTS
 
-Use Android `MediaPlayer` to play pre-rendered MP3 files. **Do not use the Android `TextToSpeech` API anywhere in this codebase.**
+Use Android `MediaPlayer` to play pre-rendered **WAV files (LINEAR16 PCM, 24 kHz mono)**. **Do not use the Android `TextToSpeech` API anywhere in this codebase. No MP3 anywhere in the pipeline** — see also the "Audio is LINEAR16/WAV end-to-end" gotcha.
 
 Two sources of audio:
-- **Bundled fixed-announcement files** in APK `res/raw/`: `alert_chime.mp3`, `termination.mp3`, `hail_and_ride_start.mp3`, `hail_and_ride_end.mp3`, `diversion_start.mp3`, `diversion_end.mp3`, `silent_keepalive.mp3`. These are updated only by shipping a new APK.
-- **Route-specific files** synced from Supabase Storage at version-keyed paths to `{filesDir}/audio/{operator_id}/{route_id}/{route_version}/`: `route_announcement.mp3` and `stop_{N}.mp3` per stop (where `N` is the stop's `stop_order`). `route_version` is `routes.updated_at` in epoch millis. Exactly one version per route is held on the tablet at a time; older versions are deleted on successful download of a new version.
+- **Bundled fixed-announcement files** in APK `res/raw/`: `alert_chime.wav`, `termination.wav`, `hail_and_ride_start.wav`, `hail_and_ride_end.wav`, `diversion_start.wav`, `diversion_end.wav`, `silent_keepalive.wav`. These are updated only by shipping a new APK. They were re-rendered once at planning time using the same Google Cloud TTS voice (`en-GB-Neural2-B`, LINEAR16 output) that produces the route-specific files. Reg 13(4) frequency-range presence (300–3000 Hz) has been **empirically verified** on the bundled set — see Compliance Mapping Matrix and `spike-records/round-3/findings-tts-frequency.md`.
+- **Route-specific files** synced from Supabase Storage at version-keyed paths to `{filesDir}/audio/{operator_id}/{route_id}/{route_version}/`: `route_announcement.wav` and `stop_{N}.wav` per stop (where `N` is the stop's `stop_order`). `route_version` is `routes.updated_at` in epoch millis. Exactly one version per route is held on the tablet at a time; older versions are deleted on successful download of a new version. Server-side, the `route-audio` Storage bucket retains the latest **three** versions per route — see dashboard CLAUDE.md and Data-Arch §6.
 
 The chime-then-announcement sequence is atomic — the chime must finish before the announcement file begins, and the announcement file must always follow if the chime plays.
 
@@ -233,7 +237,7 @@ The following announcement types are subject to the combined-alert requirement:
 - Hail-and-ride end (Reg 11(5)(b))
 
 Each MUST be:
-1. **Preceded by `alert_chime.mp3`** (bundled, under 1 second), AND
+1. **Preceded by `alert_chime.wav`** (bundled, under 1 second), AND
 2. **Accompanied by a 500ms high-contrast screen flash** (FR-AT-65) fired **simultaneously with the chime**, before the announcement overlay text appears.
 
 Both components are **co-equal** — neither alone satisfies the regulation. This is a **legal requirement**, not a UX choice.
@@ -244,18 +248,19 @@ Next-stop and route-and-destination announcements get neither the chime nor the 
 
 A journey cannot start unless **both** of the following hold for the selected route:
 1. The Room mirror of `routes.audio_render_status = 'ok'`. If it is `pending` or `failed`, the gate is closed regardless of file presence.
-2. All expected audio files exist in `{filesDir}/audio/{operator_id}/{route_id}/{route_version}/`. Expected files are derived from the route's stop count: one `route_announcement.mp3` plus one `stop_{N}.mp3` per stop.
+2. All expected audio files exist in `{filesDir}/audio/{operator_id}/{route_id}/{route_version}/`. Expected files are derived from the route's stop count: one `route_announcement.wav` plus one `stop_{N}.wav` per stop.
 
-If either check fails, show an "Audio not ready — syncing" indicator and disable the Start Journey button. Trigger a sync. There is no fallback to on-device TTS. See PRD §FR-WD-20 and Data-Arch §6.4.
+If either check fails, show the **FR-AT-28 "Audio not ready — syncing"** screen and disable the Start Journey button. The screen MUST also display the driver-facing hint **"Contact your fleet manager to verify route audio status."** on a second line (round-3 addition — silent operation is non-compliant under Reg 12(1)(b) so the gate stays a hard block; the hint at least tells the driver who to ask). Trigger a sync. There is no fallback to on-device TTS. See PRD §FR-AT-28 and Data-Arch §6.4.
 
 ### 12. [Audio gating] Tablets with `audio_enabled = false` skip audio downloads
 
-The `devices.audio_enabled` flag is a per-device boolean (dashboard-controlled, see dashboard CLAUDE.md Rule 11). When `audio_enabled = false`:
-- The sync skips the audio-download step entirely (no `route_announcement.mp3` or `stop_{N}.mp3` is fetched).
+The `devices.audio_enabled` flag is a per-device boolean (dashboard-controlled, see dashboard CLAUDE.md Rule 11). The tablet's local mirror lives in the **Room `device_state` single-row table** (Data-Arch §5.9), refreshed at the top of every sync. The audio downloader, the audio playback engine, and the §7.2 step-8 flip-detection logic all read from `device_state.audio_enabled` — **not** from SharedPreferences and **not** from a per-tablet row in a local `devices` table (there is no local `devices` table). When `audio_enabled = false`:
+
+- The sync skips the audio-download step entirely (no `route_announcement.wav` or `stop_{N}.wav` is fetched).
 - The audio manager suppresses all audio playback.
 - The visual journey UI is displayed in full — tube-map, overlays, flash alert, everything except audio.
 
-**Honest framing.** Software provides the per-device toggle and the dashboard surfaces a warning when more than one tablet in a fleet has audio enabled. **The system cannot enforce one-per-bus** — it does not know which physical bus a tablet is on. Enabling exactly one tablet per bus is operator responsibility.
+**Honest framing.** Software provides the per-device toggle and the dashboard surfaces a warning when more than one tablet in a fleet has audio enabled. **The system cannot enforce one-per-bus** — it does not know which physical bus a tablet is on. Enabling exactly one tablet per bus is operator responsibility. The dashboard's route-list view and the FR-WD-13 global failed-render indicator are the primary surfaces fleet managers use; the corresponding operator practice (verify `routes.audio_render_status = 'ok'` before next service) is named in PRD §11.2 item 9.
 
 ### 13. [UI] 22mm minimum text with calibration
 
@@ -289,9 +294,9 @@ If the hook is misconfigured or unregistered, **every operator-scoped query sile
 
 ### 17. [Telemetry] Sentry crash reporting is required
 
-The Sentry SDK is initialised in `Application.onCreate`. Uncaught exceptions and ANRs are reported. PII is stripped (no operator_id, no device_id beyond a coarse install identifier, no location). Do not disable Sentry in release builds.
+The Sentry SDK is initialised in `Application.onCreate`. Uncaught exceptions and ANRs are reported. **PII policy (matches PRD §NFR-R-07 and Data-Arch §11.2):** `device_id` is a permitted diagnostic UUID breadcrumb — it contains no personal information and is the single most useful field for correlating a crash to a real tablet, so it is **deliberately retained**. What is stripped: operator names, operator email addresses, passenger info (which the tablet never has anyway), GPS coordinates and any location data, raw stop-name strings from active journeys, and the contents of FCM payloads. Do not disable Sentry in release builds.
 
-See PRD §NFR-R-07.
+See PRD §NFR-R-07 and Data-Architecture §11.2.
 
 ---
 
@@ -299,7 +304,7 @@ See PRD §NFR-R-07.
 
 **UUIDs as TEXT in Room.** All Supabase UUIDs are stored as TEXT strings in Room. No type conversion at the boundary.
 
-**Single-row tables (`journey_state`, `sync_metadata`).** Use `@PrimaryKey(autoGenerate = false)` with `id` hardcoded to 1, and `@Insert(onConflict = OnConflictStrategy.REPLACE)` in the DAO. This prevents `SQLiteConstraintException` from race conditions — any insert overwrites the existing row.
+**Single-row tables (`journey_state`, `sync_metadata`, `device_state`).** Use `@PrimaryKey(autoGenerate = false)` with `id` hardcoded to 1, and `@Insert(onConflict = OnConflictStrategy.REPLACE)` in the DAO. This prevents `SQLiteConstraintException` from race conditions — any insert overwrites the existing row. `device_state` (Data-Arch §5.9, added in round-3 Task 3) holds device-level state the tablet maintains locally between syncs — `audio_enabled` and `last_synced_at` initially, forward-compatible for additional cached device-level fields. It is the canonical local source of `audio_enabled` (see Rule 12 and the related gotcha).
 
 **`pending_deletion` flag on routes.** If a remotely deleted route is currently active in a journey, set `pending_deletion = true` instead of `is_deleted = true`. The route stays usable for the active journey but is hidden from the route list. Cleanup runs when the journey ends.
 
@@ -319,7 +324,9 @@ The JWT carries `operator_id` as a custom claim. See architectural Rule 16.
 
 **`segment_type` on `route_stops`** and **`journey_skipped_stops` Room table.** `segment_type` (`scheduled` / `hail_and_ride`) drives H&R announcement and tube-map behaviour. `journey_skipped_stops` records stops the operator pre-marks as skipped on a journey instance (diversion handling). See CONTEXT Decision #16.
 
-**`journey_state` recovery rules.** On app restart, recover `journey_state` only if both: `last_event_at` is within the last 1 hour AND the journey is no older than 8 hours since start. Outside those bounds, discard the state. If recovery lands inside a diversion segment, **replay the diversion-start announcement** (full chime + flash + audio sequence).
+**`journey_state` recovery rules.** On app restart, recover `journey_state` only if both: `last_event_at` is within the last 1 hour AND the journey is no older than 8 hours since start. Outside those bounds, discard the state. If recovery lands inside a diversion segment, **replay the diversion-start announcement** (full chime + flash + audio sequence) — and that replay sets `diversion_invoked_at_any_point = true` (see latch entry below).
+
+**`journey_state.diversion_invoked_at_any_point` is a one-way latch.** Round-3 addition (Data-Arch §5.5). Set `true` when the driver triggers **FR-AT-25 Diversion Start** (or when a recovery replays a diversion-start). **Never reset to false mid-journey**, even when the driver triggers FR-AT-26 Diversion End. Reset to the default `false` only when a new journey starts. Consumed by the FR-AT-66 journey-summary upload (`diversion_invoked = journey_state.diversion_invoked_at_any_point` evaluated at journey end) so that a journey which ever involved a diversion is reported as such, regardless of whether the diversion was still active at the natural end.
 
 **`journey_events` lifecycle.** Cleared at **both** app startup and journey start (defensive double-cleanup; round-2 Task 3 fix).
 
@@ -438,6 +445,22 @@ When showing a timestamp to the user (e.g., "last synced at 14:32"), convert fro
 
 The `route_version` path component (`routes.updated_at` in epoch millis) changes on every successful re-render of the route's audio. Don't cache absolute audio paths in long-lived state — always resolve through the current `route_version` from the Room mirror of `routes`. A stale cached path will point at a directory that has been deleted as part of version cleanup.
 
+### Audio is LINEAR16/WAV end-to-end — no MP3 anywhere
+
+Round-3 Task 2 switched the audio pipeline from MP3 to **LINEAR16 PCM, 24 kHz mono, WAV** end-to-end. The Google Cloud TTS API call uses `audioEncoding: 'LINEAR16'`; the worker writes `.wav` files to the `route-audio` Storage bucket; the tablet downloads and plays `.wav` files with `MediaPlayer` (which plays WAV natively, no extra dependency). The bundled fixed-announcement files in `res/raw/` are also WAV.
+
+Why: Reg 13(4) requires a specific frequency range (300–3000 Hz) be preserved; MP3 perceptual coding cannot be relied on to preserve it without per-file verification. LINEAR16 is lossless and Reg 13(4) frequency presence has been empirically verified on the bundled set (see `spike-records/round-3/findings-tts-frequency.md`). The cost is file size: WAV files are ~10× larger than MP3 (a 5-second stop announcement is ~240 KB). Storage and bandwidth budgets account for this; do not "optimise" by re-introducing MP3 anywhere in the pipeline.
+
+If you see `.mp3` in a path, a Storage call, or a `MediaPlayer` setDataSource argument, that is a bug.
+
+### Local `audio_enabled` lives in Room `device_state`, not SharedPreferences
+
+The tablet's local mirror of its own `devices.audio_enabled` value lives in the **Room `device_state` single-row table** (Data-Arch §5.9). It is **not** in SharedPreferences and there is **not** a local `devices` Room table. The audio downloader, the audio playback engine, and the §7.2 step-8 flip-detection logic all read from `device_state.audio_enabled`. The sync writes `device_state` at the top of the cycle (step 7) and again at the bottom (step 8 ends with an update of `audio_enabled + last_synced_at`). Don't duplicate this value anywhere else.
+
+### Auto-deregistration is a compound condition
+
+The previous "60 days of silence → auto-deregister" rule is now a **compound condition** (Data-Arch §10, round-3 Task 3): a tablet is auto-deregistered only when `last_seen_at` is older than 60 days **AND** `recover_failure_count >= 5` with `last_recover_failure_at` in the trailing 60-day window. Plain silence (seasonal storage, in-repair tablets, dead batteries) never accumulates failure counts and so retains its `devices` row indefinitely — though it still drops out of the billable count after the 30-day silence threshold. Only actively-rejected tablets (operator-decommissioned, hitting terminal `recover-device` failures repeatedly) trip the compound condition. See `devices.recover_failure_count` and `devices.last_recover_failure_at`.
+
 ### Custom access token hook misconfiguration
 
 If RLS-scoped queries unexpectedly return empty for a paired tablet, the most likely cause is that the `custom_access_token_hook` is not registered in the Supabase Auth console. The hook is a **manual** dashboard step (not a migration); it is easy to forget after a project reset or environment switch. Check the hook before debugging RLS policies or Kotlin code.
@@ -446,13 +469,15 @@ If RLS-scoped queries unexpectedly return empty for a paired tablet, the most li
 
 On first run (and on every subsequent launch as a cheap check), the app must detect Google Play Services availability via `GoogleApiAvailability.isGooglePlayServicesAvailable()`. If unavailable, surface a clear blocking warning. There is a "continue anyway" override (logged to `journey_events`) for development/testing on non-GMS hardware — production tablets must be GMS-certified. Don't crash; don't proceed silently.
 
-### Token recovery — transient vs terminal (FR-AT-04)
+### Token recovery — transient vs terminal (FR-AT-04 and FR-AT-50)
 
 The `recover-device` Edge Function distinguishes two failure classes:
 - **Transient** (network, 5xx, 429): retain cached credentials, retry with backoff. The tablet stays in service.
 - **Terminal** (404, 401, `activation_state = 'inactive'`, operator status not `active`): wipe local credentials and force re-pair.
 
-Surface different UI for each — a transient retry banner vs. a "this device has been deactivated, please re-pair" screen. Do not collapse them into a single "recovery failed" state.
+**Credential wipe scope (parity across FR-AT-04 terminal recovery and FR-AT-50 admin deregister).** When wiping, remove **all three** secrets from EncryptedSharedPreferences in a single transaction: **JWT, refresh token, AND `device_secret`**. The two paths must wipe the same set — an incomplete wipe that leaves the `device_secret` behind would obstruct re-pairing because the tablet would still hold a recovery credential it cannot use. Round-3 Task 3 codified this parity (resolves round-3 finding 10).
+
+Surface different UI for each transient vs terminal recovery — a transient retry banner vs. a "this device has been deactivated, please re-pair" screen. Do not collapse them into a single "recovery failed" state.
 
 ### FCM payload schema
 
@@ -491,6 +516,20 @@ If you need to know "what does feature X do?", ask the user. If you need to know
 
 ---
 
+## Sweep Summary (v3.9 changelog detail)
+
+Round-3 deltas (v3.8 → v3.9) now reflected:
+- **Audio format switched MP3 → LINEAR16 WAV end-to-end.** File tree, Rule 9, Rule 10, Rule 11, Rule 12, the audio-path-mutation gotcha, and the new "Audio is LINEAR16/WAV end-to-end" gotcha all use `.wav`. Google Cloud TTS call uses `audioEncoding: 'LINEAR16'`. `MediaPlayer` plays WAV natively.
+- **Reg 13(4) frequency-range empirically verified** on the bundled set (see Compliance Mapping Matrix and `spike-records/round-3/findings-tts-frequency.md`); no longer a pre-deployment blocker.
+- **Rule 17 Sentry PII rewritten.** `device_id` is a permitted diagnostic UUID breadcrumb (no personal information). Stripped fields: operator names/emails, passenger info, location/GPS, raw stop-name strings from active journeys, FCM payloads. Matches PRD §NFR-R-07 and Data-Arch §11.2.
+- **FR-AT-50 wipe scope clarified** to enumerate JWT + refresh token + device_secret in EncryptedSharedPreferences. Parity with FR-AT-04 terminal recovery codified in the gotcha.
+- **Compound 60-day auto-deregistration** (silence AND ≥5 failed `recover-device` attempts) replaces the simple 60-day silence rule. Distinguishes seasonal/in-repair silence from active rejection. References `devices.recover_failure_count` and `devices.last_recover_failure_at`.
+- **`device_state` Room single-row table** (Data-Arch §5.9) is the canonical local source of `audio_enabled` — referenced in the Single-row tables decision, Rule 12, and the new "Local `audio_enabled` lives in Room `device_state`" gotcha.
+- **`journey_state.diversion_invoked_at_any_point` one-way latch** documented in the Key Data Decisions section. Set on diversion-start; never reset mid-journey; reset to default only on a new journey; consumed by FR-AT-66 journey-summary upload.
+- **FR-AT-28 "Audio not ready — syncing" screen** now spec'd to include the driver hint "Contact your fleet manager to verify route audio status." Operator-side practice (verify `audio_render_status = 'ok'` before next service) named in Rule 12 with the FR-WD-13 indicator surface.
+
+---
+
 ## Sweep Summary (v3.8 changelog detail)
 
 Round-1 deltas (v3.0 → v3.7) now reflected:
@@ -523,7 +562,7 @@ Round-2 deltas (v3.7 → v3.8) now reflected:
 - FR-AT-67 GMS detection at first run.
 - FR-AT-04 transient vs terminal recovery classification.
 - `devices.status` renamed `devices.activation_state` (CHECK constraint).
-- 30-day heartbeat-billable / 60-day auto-deregister policy.
+- 30-day heartbeat-billable; compound 60-day auto-deregister (silence AND ≥5 failed recover-device attempts — refined in round-3 Task 3, see "Auto-deregistration is a compound condition" gotcha). Seasonal/in-repair tablets retain their `devices` row indefinitely; only actively-rejected tablets are auto-deregistered.
 - `rate_limit_attempts` table for `pair-device` / `recover-device`.
 - FCM data-only payload schema `{ type, operator_id, trigger }`.
 - Custom access token hook registration is a manual Supabase Auth console step.

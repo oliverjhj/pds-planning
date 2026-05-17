@@ -1,10 +1,15 @@
 # WORKFLOW.md
 # Passenger Display System (PDS) — Operating Manual
 
-**Version:** 3.8
+**Version:** 3.9
 **Last Updated:** May 2026
 
 ## Changelog
+
+### v3.9 (May 2026)
+Round-3 post-adversarial-review close-out additions.
+- §13.7 (strengthened): the CLAUDE.md propagation rule now mandates a **per-prompt impact list**. Every prompt in a re-planning campaign must produce, as a named deliverable, a "CLAUDE.md changes required from this prompt" list with line numbers and content guidance; the actual edits still happen in the final close-out task, but the impact lists are gathered as the campaign proceeds rather than reconstructed at the end. The architect writing prompts for any future campaign is responsible for explicitly asking each prompt to produce its impact list. Why: round 2 added §13.7 as a close-out, but round 3 still produced six-plus stale CLAUDE.md references mid-campaign because the rule fired only once per campaign. Per-prompt impact lists make CLAUDE.md drift visible during the campaign instead of after.
+- §15 (new): Round-3 Lessons. Three operational practices to preserve: (a) the **verification spike pattern** — empirical verification of architectural assumptions (the pg_boss-in-Deno spike, the Reg 13(4) frequency check) is fast and high-value; when an adversarial review surfaces an assumption-not-evidence, the right answer is often a half-day spike, not a doc edit. (b) **"Report contradictions, do not fix" stays** — round 1 (no rule) produced cascading scope creep; rounds 2 and 3 (rule in place) kept prompts focused. (c) **Diminishing returns are real** — round 1 found 19 structural findings; round 2 found ~30 consequential findings (including the CLAUDE.md meta-problem); round 3 found ~20 mostly-fixable findings plus one empirical question and one operational-reality acknowledgement. The round-3 reviewer noted explicitly that a round 4 would yield approximately zero new architectural problems. Do not run round 4.
 
 ### v3.8 (May 2026)
 Round-2 post-adversarial-review close-out additions.
@@ -559,21 +564,26 @@ If the frozen documents *do* need to change (case 1 above), the new version incr
 
 This happens at re-planning time, never mid-build. There is no concept of "the architect quietly updated PRD.md to match what we ended up building" — if the agreement changes, it changes deliberately, and the version number reflects that.
 
-### 13.7 CLAUDE.md Propagation is a Mandatory Close-Out
+### 13.7 CLAUDE.md Propagation is a Mandatory Close-Out (with Per-Prompt Impact Lists)
 
 Any re-planning event that bumps the version of any frozen document MUST include, as the final task of that event, a sweep of the relevant CLAUDE.md file(s) to mirror the frozen-doc changes. **Frozen status does not re-engage** until that sweep is done and the CLAUDE.md files carry the same version number as the frozen documents.
 
-**Why.** The builder reads only CLAUDE.md (§1.2). If CLAUDE.md lags the frozen suite, the builder will scaffold features the frozen docs have cut, omit features the frozen docs have added, and enforce rules that no longer match reality. The round-2 adversarial review identified exactly this drift: the CLAUDE.md files had not been touched across the entire round-1 v3.0 → v3.7 campaign and would, on day one of the build, have instructed the builder to bundle NaPTAN, build upload-sync, support Kiosk Level 2, frame approval as a boolean, and call a deprecated audio-render Edge Function — all contradicted by the frozen suite. The propagation rule exists to make that failure structurally impossible in future rounds.
+**Strengthened in v3.9 — the per-prompt impact list requirement.** Every prompt in a re-planning campaign — not only the final close-out task — must include in its scope a deliverable titled "CLAUDE.md changes required from this prompt." The deliverable lists, with line numbers and content guidance, what changes the prompt's frozen-doc edits will require in either CLAUDE.md file. The deliverable is produced by the prompt's Claude Code execution alongside the frozen-doc edits; the actual CLAUDE.md file edits still happen in the final close-out task, but the impact lists are gathered as the campaign proceeds so that the close-out task is a consolidation of named work, not a from-scratch reconstruction.
+
+**Architect responsibility for the per-prompt rule.** Whoever is writing prompts for any future re-planning campaign is responsible for explicitly asking each prompt to produce its impact list. A prompt that does not name the impact list as a deliverable is incomplete — the architect should add the deliverable before sending the prompt. The close-out task's prompt then names the consolidated impact lists from all prior prompts as its work list.
+
+**Why.** The builder reads only CLAUDE.md (§1.2). If CLAUDE.md lags the frozen suite, the builder will scaffold features the frozen docs have cut, omit features the frozen docs have added, and enforce rules that no longer match reality. The round-2 adversarial review identified exactly this drift: the CLAUDE.md files had not been touched across the entire round-1 v3.0 → v3.7 campaign and would, on day one of the build, have instructed the builder to bundle NaPTAN, build upload-sync, support Kiosk Level 2, frame approval as a boolean, and call a deprecated audio-render Edge Function — all contradicted by the frozen suite. Round 2 added the close-out sweep rule to make that failure mode structurally impossible. **But round 3 then surfaced six-plus more stale CLAUDE.md references — produced inside the round-2 campaign itself.** The close-out rule alone did not catch them because the rule fired only once, at the end, and the close-out task had to reconstruct the impact list from memory of the campaign. The v3.9 strengthening — per-prompt impact lists — makes CLAUDE.md drift visible *during* the campaign rather than after, and gives the close-out task a deterministic work list.
 
 **How to apply.** A re-planning event's task list is not complete until:
 
-1. Every frozen-doc change has been classified as "affects Android CLAUDE.md", "affects dashboard CLAUDE.md", "affects both", or "no CLAUDE.md impact". This classification is explicit, not implicit.
-2. The affected CLAUDE.md files have been edited to reflect the changes — architectural rules updated, added, or removed; project structure refreshed; gotchas added; data decisions reflected; coordination lists updated; setup notes added for any new manual steps.
-3. Both CLAUDE.md files have been version-bumped to the same version number as the frozen suite, with a changelog entry summarising the sweep. The bump applies even to the CLAUDE.md file with "no impact" — keeping all four documents at the same version number is itself a useful invariant.
+1. Every prompt in the campaign has produced its "CLAUDE.md changes required from this prompt" deliverable. The architect collects these as the campaign proceeds.
+2. Every frozen-doc change has been classified as "affects Android CLAUDE.md", "affects dashboard CLAUDE.md", "affects both", or "no CLAUDE.md impact". This classification is explicit, not implicit.
+3. The affected CLAUDE.md files have been edited to reflect the changes — architectural rules updated, added, or removed; project structure refreshed; gotchas added; data decisions reflected; coordination lists updated; setup notes added for any new manual steps. The close-out task uses the consolidated per-prompt impact lists as its work list.
+4. Both CLAUDE.md files have been version-bumped to the same version number as the frozen suite, with a changelog entry summarising the sweep. The bump applies even to the CLAUDE.md file with "no impact" — keeping all four documents at the same version number is itself a useful invariant.
 
-Only then does the frozen-documents rule re-engage. **A re-planning campaign that ends without a CLAUDE.md sweep is, by definition, incomplete.**
+Only then does the frozen-documents rule re-engage. **A re-planning campaign that ends without a CLAUDE.md sweep — or whose prompts did not produce per-prompt impact lists — is, by definition, incomplete.**
 
-The architect is responsible for both producing the sweep task (typically as the final task of the campaign) and verifying that the sweep is comprehensive before declaring the campaign closed. The "frozen-doc cross-reference grep" — searching the frozen suite for every term the sweep was supposed to address and confirming no stale wording remains — is part of the close-out.
+The architect is responsible for: producing the sweep task (typically as the final task of the campaign), explicitly asking each campaign prompt to produce its CLAUDE.md impact list, and verifying that the sweep is comprehensive before declaring the campaign closed. The "frozen-doc cross-reference grep" — searching the frozen suite for every term the sweep was supposed to address and confirming no stale wording remains — is part of the close-out.
 
 ---
 
@@ -586,6 +596,18 @@ Two operational practices proved their value in the round-2 campaign and warrant
 **Adversarial review of planning artefacts is run before any build, not after.** Round 1 produced v3.7. The round-2 adversarial review caught significant issues that would otherwise have surfaced as build-time defects: CLAUDE.md drift, heartbeat ownership confusion, audio pipeline cost/latency assumptions, FCM-render race, divergence-detection trigger-happiness. The cost of finding those in planning is hours; the cost of finding them in build is days plus throwaway code. Run the adversarial pass before unfreezing for build, and run it against the **complete** package including the CLAUDE.md files and CONTEXT.md — not just the four formally-frozen documents.
 
 **Review cadence is decided round-by-round.** The team did not commit upfront to a fixed number of adversarial-review rounds. Each round's output was evaluated on its own merits; the decision to run a round 3 (or not) is made after round 2's deliverables are in hand. A round that yields a single small finding may not justify a follow-up; a round that yields structural rework usually does. Don't pre-commit to a cadence; let the findings drive it.
+
+---
+
+## 15. Round-3 Lessons
+
+Round 3 of the adversarial-review re-planning campaign produced three operational lessons worth codifying so future rounds either preserve them (the practices) or honour them (the stopping condition).
+
+**The verification spike pattern: empirical checks beat doc edits for assumptions-not-evidence.** Round 3 included a deliberate first task — a verification spike — before any doc edits were made. Two assumptions in the v3.8 frozen suite were called out by the adversarial review as "asserted, not verified": that `pg_boss` would work correctly inside Deno Edge Function isolates, and that the locked Google Cloud TTS voice (`en-GB-Neural2-B`, LINEAR16) would preserve the Reg 13(4) frequency range (300–3000 Hz). Each was checked empirically — pg_boss with a small Deno proof-of-concept against a real Supabase project, the voice with an offline FFT pass over rendered samples. Both came back positive **with configuration guardrails** (the pg_boss `{ supervise: false, schedule: false }` rule; the LINEAR16/WAV-end-to-end rule). The cost was less than a day; the value was that the round-3 doc edits proceeded on verified ground rather than further-asserted ground. Future re-planning campaigns: when an adversarial review surfaces an assumption-not-evidence, the right first move is often a half-day spike, not a doc edit. Record findings in `spike-records/round-N/` so the empirical answer is durable.
+
+**"Report contradictions, do not fix" stays.** Round 1 did not have this rule and individual tasks bled into adjacent areas, producing scope creep and inconsistent intermediate states across the seven-task campaign. Rounds 2 and 3 (rule in place) kept individual prompts narrowly scoped. Each task reported contradictions found in adjacent documents to a parking lot; a dedicated close-out task resolved them. The cost was one extra task per round; the benefit was that every contradiction was resolved with deliberate cross-document attention, and no task silently rewrote something outside its declared scope. Retain the rule. The §14 wording remains accurate; round 3 confirms it.
+
+**Diminishing returns are real — do not run round 4.** The progression of findings across rounds: round 1 produced 19 findings, almost all structural (the dashboard surface, frozen-documents rule, pre-rendered audio architecture). Round 2 produced ~30 findings, consequential (the CLAUDE.md drift meta-problem, audio pipeline cost/latency, FCM-render race, heartbeat ownership, FR-WD-12 over-firing, multi-tablet honest framing, crash telemetry). Round 3 produced ~20 findings, mostly fixable (contradictions, missing details, the pg_boss-in-Deno empirical question, an operator-responsibility acknowledgement). The round-3 reviewer noted explicitly in their summary that **a round 4 would yield approximately zero new architectural problems** — the surface of plannable concerns has been thoroughly mapped, and what remains is best surfaced by the build itself. **Do not run round 4 as another adversarial-review round.** The cost of further pre-build review exceeds the benefit. If a future build genuinely surfaces a planning problem, that triggers a new re-planning event proper (under the §13 frozen-documents rule), not another adversarial-review round on the existing planning suite. The end of round 3 is the end of the adversarial-review campaign; the next event is Stage 1 (dashboard MVP).
 
 ---
 

@@ -1,14 +1,17 @@
 # CLAUDE.md
 # Passenger Display System (PDS) — Web Dashboard
 
-**Version:** 3.8 (May 2026)
+**Version:** 3.9 (May 2026)
 
 This file is your reference for working on the PDS web dashboard. Read it at the start of every session. It contains conventions, architectural rules, and known gotchas. If a rule here conflicts with a prompt, ask before deviating.
 
 ## Changelog
 
+### v3.9 (May 2026)
+Round-3 post-adversarial-review close-out sweep. Applies the per-prompt CLAUDE.md impact lists produced by round-3 Tasks 2 and 3. Substantive deltas — itemised in the v3.9 sweep summary at the end of this file — include: audio file format switched MP3 → **LINEAR16 WAV** end-to-end (Rule 10 narrative, "LINEAR16/WAV end-to-end" gotcha); **pg_boss configuration inviolable rule** (`{ supervise: false, schedule: false }` + hourly `pgboss-maintain` scheduled function) added; **`audio-render-worker` IS a scheduled Supabase Edge Function** (corrects the v3.8 Setup Notes wording that called it a separately-deployed runtime) — verified empirically in `spike-records/round-3/findings-pg_boss.md`; FR-WD-21 two-layer deduplication gotcha; FR-WD-19 cross-reference fixed (now §FR-WD-22 + §5.2 for the audio-toggle context — FR-WD-19 was renumbered to HTTPS in round 2); **staging environment** setup added (two Supabase projects + two Vercel targets + six Sentry DSNs); **operator-practice note** linking PRD §11.2 item 9 to the FR-WD-13 global failed-render indicator surface; Reg 13(4) frequency-range now empirically verified.
+
 ### v3.8 (May 2026)
-Previously unversioned. Brought into sync with the v3.8 planning suite via the round-2 close-out sweep. Reflects all round-1 (PRD/Data-Arch/Compliance v3.0 → v3.7) and round-2 (v3.7 → v3.8) decisions that had never propagated into CLAUDE.md. Substantive deltas — itemised in "Sweep summary" at the end of this file — include: operator-status three-state enum (`pending`/`active`/`suspended`) replacing boolean `is_approved`, with `/suspended` route added; audio pipeline replaced by `pg_boss` job queue + Google Cloud TTS + version-keyed Storage paths + render-then-FCM ordering (dashboard now calls `enqueue-render-job`, never the deprecated synchronous `render-route-audio` Edge Function); per-device `audio_enabled` toggle in fleet view with honest one-per-bus framing; FR-WD-12 divergence detection rewritten to structural `stops_content_hash` comparison; `devices.activation_state` rename; `routes.audio_render_status` + `routes.audio_version` + `routes.audio_announcement_hash` + `routes.stops_content_hash` columns; `journey_summaries` + `rate_limit_attempts` shared tables; `route-audio` Storage bucket; manual custom-access-token-hook setup step; Sentry crash telemetry; hard-delete language removed; anonymous Auth user accumulation acknowledged.
+Previously unversioned. Brought into sync with the v3.8 planning suite via the round-2 close-out sweep. Reflects all round-1 (PRD/Data-Arch/Compliance v3.0 → v3.7) and round-2 (v3.7 → v3.8) decisions that had never propagated into CLAUDE.md. Substantive deltas — itemised in the v3.8 sweep summary at the end of this file — include: operator-status three-state enum (`pending`/`active`/`suspended`) replacing boolean `is_approved`, with `/suspended` route added; audio pipeline replaced by `pg_boss` job queue + Google Cloud TTS + version-keyed Storage paths + render-then-FCM ordering (dashboard now calls `enqueue-render-job`, never the deprecated synchronous `render-route-audio` Edge Function); per-device `audio_enabled` toggle in fleet view with honest one-per-bus framing; FR-WD-12 divergence detection rewritten to structural `stops_content_hash` comparison; `devices.activation_state` rename; `routes.audio_render_status` + `routes.audio_version` + `routes.audio_announcement_hash` + `routes.stops_content_hash` columns; `journey_summaries` + `rate_limit_attempts` shared tables; `route-audio` Storage bucket; manual custom-access-token-hook setup step; Sentry crash telemetry; hard-delete language removed; anonymous Auth user accumulation acknowledged.
 
 ---
 
@@ -141,9 +144,10 @@ Deployment to Vercel happens automatically on push to `main`. The user manages V
 Manual setup steps that are easy to miss and have non-obvious failure modes if forgotten.
 
 - **Custom access token hook (Supabase Auth console — manual step).** Server-side hook that stamps `operator_id` into the JWT custom claims for every issued token. This is a manual action in the Supabase Auth dashboard; it does NOT travel in migrations. Without it, **every operator-scoped RLS policy quietly returns empty** for both dashboard and tablet sessions. See Data-Architecture §12 setup checklist. After any project reset, re-register before debugging anything else.
-- **Sentry DSN.** Configured via Vercel environment variable; do not commit the DSN to git.
+- **Sentry DSN.** Configured via Vercel environment variable; do not commit the DSN to git. **Stage 1 setup uses six DSNs total** — three surfaces (Android, dashboard, Edge Functions) × two environments (staging, production). See "Staging environment" below.
 - **pg_boss schema.** The audio pipeline runs on `pg_boss` (Postgres-backed job queue). `pg_boss` owns its own schema in the Supabase database — see Data-Arch §11. Migrations are managed by `pg_boss` itself, not by the dashboard repo.
-- **`audio-render-worker` deployment.** The worker is a separate runtime that polls the `pg_boss` queue. It is not a Supabase Edge Function and is deployed independently. The dashboard does not own its deployment — it only enqueues jobs.
+- **`audio-render-worker` is a scheduled Supabase Edge Function** (round-3 verification spike correction). The worker polls the `pg_boss` queue on a schedule from inside a Deno Edge Function isolate. **It MUST construct pg_boss with `{ supervise: false, schedule: false }`** — the default configuration assumes a long-lived process and fights the Deno isolate runtime. A separate scheduled Edge Function `pgboss-maintain` calls `boss.maintain()` hourly (cron `0 * * * *`) to handle archival, retention, and expiry — those operations live in the supervisor that the worker disables. The configuration is verified empirically in `spike-records/round-3/findings-pg_boss.md` and is treated as an inviolable architectural rule (also stated in Rule 10).
+- **Staging environment.** Stage 1 setup requires **two Supabase projects** (production and staging), **two Vercel deployment targets**, and **six Sentry DSNs** (three surfaces × two environments). Vercel preview deploys point at staging; `main`-branch deploys point at production. The full setup checklist, including ordering dependencies between the manual steps (Supabase project create → custom access token hook → schema migrations → Edge Function deploy → Sentry DSN configuration → Vercel env vars), is in Data-Arch §12. Do not skip the staging environment for "speed" — without it, the only way to verify a schema change is against production.
 
 ---
 
@@ -242,7 +246,9 @@ After the RPC succeeds, the Server Action enqueues an audio render job via the `
 
 ### 10. [Audio] Audio rendering happens via `pg_boss`, not by the dashboard
 
-The dashboard **enqueues** an audio render job and returns. A separate worker — `audio-render-worker` — consumes the `render-route-audio` job from the `pg_boss` queue, calls **Google Cloud TTS** (voice `en-GB-Neural2-B`, locked) for each line, writes versioned MP3 files to the `route-audio` Storage bucket at `{operator_id}/{route_id}/{route_version}/...`, and on success bumps `routes.audio_version`-equivalent state (`audio_render_status = 'ok'`, `audio_announcement_hash` updated).
+The dashboard **enqueues** an audio render job and returns. The `audio-render-worker` Edge Function — a scheduled Supabase Edge Function — consumes the `render-route-audio` job from the `pg_boss` queue, calls **Google Cloud TTS** (voice `en-GB-Neural2-B`, locked, `audioEncoding: 'LINEAR16'`) for each line, writes versioned **WAV files (LINEAR16 PCM, 24 kHz mono)** to the `route-audio` Storage bucket at `{operator_id}/{route_id}/{route_version}/...`, and on success bumps `routes.audio_version`-equivalent state (`audio_render_status = 'ok'`, `audio_announcement_hash` updated). The bucket retains the latest **three** versions per route (round-3 increase from two — supports an in-flight tablet, the new active version, and one rollback target).
+
+**pg_boss configuration (INVIOLABLE RULE).** The `audio-render-worker` MUST construct pg_boss with `{ supervise: false, schedule: false }`. The default pg_boss configuration assumes a long-lived host process and starts background maintenance loops that conflict with the Deno Edge Function isolate's short, scheduled invocations. A separate scheduled Edge Function `pgboss-maintain` calls `boss.maintain()` hourly (cron `0 * * * *`) to handle the archival/retention/expiry work that the disabled supervisor would otherwise perform. This configuration is **verified empirically** in `spike-records/round-3/findings-pg_boss.md`; the previous v3.8 framing (that the worker was a "separately-deployed runtime, not an Edge Function") was incorrect and has been corrected throughout v3.9. See Data-Arch §4.6 (pg_boss INVIOLABLE RULE subsection).
 
 **Render-then-FCM is mandatory.** The worker — not a DB trigger, not the dashboard — dispatches the FCM data-only push that triggers the tablet to sync, AFTER the audio files are in Storage. Tablets must not be told to sync before the new audio is available, or they will 404 trying to download it.
 
@@ -250,13 +256,17 @@ The dashboard **enqueues** an audio render job and returns. A separate worker �
 
 **The deprecated synchronous `render-route-audio` Edge Function is gone.** Do not call it; it does not exist. The name `render-route-audio` survives only as the `pg_boss` **job name** queued by `enqueue-render-job`.
 
+**Reg 13(4) frequency-range presence has been empirically verified** on the LINEAR16 output (see Compliance Mapping Matrix and `spike-records/round-3/findings-tts-frequency.md`). The previous "TTS verification required pre-deployment" / "BLOCKING WORK" framing no longer applies. A future voice change is itself a Case 1 re-planning event and would require fresh verification.
+
 ### 11. [Audio] `audio_enabled` toggle in the fleet view
 
 The fleet view exposes a per-device `audio_enabled` boolean toggle (Server Action: `setAudioEnabled`). Defaults: the first tablet paired to an operator → `true`; subsequent tablets → `false`.
 
-**Honest framing.** This is a **per-device** control. The operator's responsibility is to enable audio on exactly one tablet per bus. The dashboard surfaces a **non-blocking warning** when more than one tablet in an operator's fleet has `audio_enabled = true` (e.g., "3 tablets have audio enabled — ensure only one per bus"). The dashboard does **not** enforce the one-per-bus constraint because the system cannot tell which physical bus a tablet is on. See PRD §FR-WD-19, §5.2.
+**Honest framing.** This is a **per-device** control. The operator's responsibility is to enable audio on exactly one tablet per bus. The dashboard surfaces a **non-blocking warning** when more than one tablet in an operator's fleet has `audio_enabled = true` (e.g., "3 tablets have audio enabled — ensure only one per bus") — and a **separate** non-blocking warning (FR-WD-22) when an operator's fleet has zero `audio_enabled = true` devices. The dashboard does **not** enforce the one-per-bus constraint because the system cannot tell which physical bus a tablet is on. See PRD §FR-WD-22 and §5.2 (FR-WD-19 was renumbered to HTTPS in round 2 and no longer relates to the audio toggle).
 
 Tablets with `audio_enabled = false` skip audio downloads entirely (not just playback) — see Android CLAUDE.md Rule 12. Toggling a tablet from `false` to `true` will trigger an audio download on the tablet's next sync.
+
+**Operator practice — route edits before service.** PRD §11.2 item 9 names the operator-side practice that pairs with the FR-AT-28 driver hint on the tablet: fleet managers should verify `routes.audio_render_status = 'ok'` for affected routes before the next service, particularly for routes edited shortly before that service runs. The dashboard's **route-list view** (FR-WD-13) and the **global failed-render indicator** (FR-WD-13, persistent across pages, dismissible per-route only) are the primary surfaces fleet managers use; both should be implemented to be visible and obvious. A failed render that an operator does not notice produces the "compound fleet-blocked window" risk row in PRD §13 — minimise it by making the surface impossible to miss.
 
 ### 12. [Routes] FR-WD-12 divergence detection is structural (content hash)
 
@@ -442,6 +452,23 @@ Production environment variables are set in Vercel's dashboard, not in the repo.
 
 If a future task tempts you to "just fire FCM directly from the dashboard so the tablets refresh faster" — don't. The tablets will 404 trying to download audio that hasn't been rendered yet. The `audio-render-worker` is the only component that dispatches the post-save FCM push, and only after render success. See Rule 10.
 
+### Audio pipeline is LINEAR16/WAV end-to-end — no MP3 anywhere
+
+Round-3 Task 2 switched the audio pipeline from MP3 to LINEAR16 PCM, 24 kHz mono, WAV end-to-end. The Google Cloud TTS API call uses `audioEncoding: 'LINEAR16'`; the worker writes `.wav` files to the `route-audio` Storage bucket; the tablet plays `.wav` files. Why: Reg 13(4) requires preservation of a specific frequency range (300–3000 Hz) and MP3 perceptual coding cannot be relied on to preserve it without per-file verification. LINEAR16 is lossless and verification is empirical (see `spike-records/round-3/findings-tts-frequency.md`). File size is the cost: WAV files are ~10× larger than MP3 (~240 KB per 5-second stop announcement); storage and bandwidth budgets account for this. If you see `.mp3` in a path, a Storage call, or an Edge Function argument anywhere in the pipeline, that is a bug.
+
+### FR-WD-21 Re-Render Audio has two-layer deduplication
+
+The dashboard's Re-Render Audio button (FR-WD-21) has two-layer deduplication and you must implement both:
+
+- **Client-side (UX only).** When the button is clicked, disable it and show a spinner for **60 seconds**, OR until the route's `audio_render_status` flips to `ok` or `failed` — whichever comes first. This prevents the user from spamming the button while a render is in flight and produces the impression of immediate response.
+- **Server-side (authoritative).** The `enqueue-render-job` Edge Function checks pg_boss for an existing `created` or `active` job at the same `(route_id, route_version)`. If one exists, it short-circuits and returns the existing job ID without enqueuing a duplicate.
+
+The server-side check is the actual deduplication. **Do not skip it** because "the client-side disable handles it" — a user with two tabs open, an over-keen retry, or a future automated trigger could bypass the client-side disable and the server would then dispatch redundant FCM pushes. The client-side disable is purely UX.
+
+### `pg_boss` is configured `{ supervise: false, schedule: false }` — never change this
+
+Rule 10 names this as inviolable. If you find yourself reading pg_boss documentation that says "you must call `boss.start()`" without these options, that documentation is for long-lived host processes. The Deno Edge Function isolate is short-lived and scheduled externally, and the supervisor/scheduler loops conflict with that lifecycle. Maintenance work that the disabled supervisor would have done (archival, expiry, retention) is handled by the `pgboss-maintain` scheduled Edge Function running hourly. Verified in `spike-records/round-3/findings-pg_boss.md`.
+
 ---
 
 ## What to Do When Stuck
@@ -466,8 +493,8 @@ The dashboard and the Android app are in separate repositories but share:
 - **The Supabase project and schema**, including RLS policies and the `custom_access_token_hook`.
 - **Tables:** `operators`, `devices`, `routes`, `route_stops`, `naptan_stations`, `device_pairing_codes`, `journey_summaries`, `rate_limit_attempts`.
 - **Edge Functions** called from the dashboard: `generate-pairing-code`, `pair-device`, `recover-device`, `enqueue-render-job`. The dashboard does NOT call `render-route-audio` — that name is now the `pg_boss` job name, not an Edge Function; the dashboard interacts with it only by enqueuing via `enqueue-render-job`.
-- **Worker:** `audio-render-worker` consumes the `render-route-audio` `pg_boss` job, calls Google Cloud TTS, writes to the `route-audio` Storage bucket, and dispatches the post-render FCM push. Not directly invoked by the dashboard; deployed independently.
-- **Storage bucket:** `route-audio` (object scheme: `{operator_id}/{route_id}/{route_version}/...`). Written by the worker; read by tablets.
+- **Scheduled Edge Functions** (not invoked from the dashboard but part of the shared backend): `audio-render-worker` (polls the `pg_boss` queue, consumes `render-route-audio` jobs, calls Google Cloud TTS, writes versioned WAV files to `route-audio`, dispatches the post-render FCM push; constructed with `{ supervise: false, schedule: false }` — see Rule 10) and `pgboss-maintain` (hourly `boss.maintain()` call).
+- **Storage bucket:** `route-audio` (object scheme: `{operator_id}/{route_id}/{route_version}/...`, file format: LINEAR16 PCM 24 kHz mono WAV). Written by `audio-render-worker`; read by tablets. Retains the latest three versions per route.
 - **Auth model:** Supabase Auth users for both operators (regular email/password) and devices (anonymous, created by `pair-device`). The custom access token hook stamps `operator_id` into the JWT custom claims for both — RLS depends on this.
 
 If a feature in the dashboard implies a schema change, that change affects the Android app too. The architect coordinates schema changes deliberately — never modify the database schema as a side effect of a dashboard task.
@@ -479,6 +506,22 @@ If a feature in the dashboard implies a schema change, that change affects the A
 This file is **not** a specification. It does not describe what the dashboard does. The PRD describes that. This file describes **how to work on the dashboard**.
 
 If you need to know "what does feature X do?", ask the user. If you need to know "how do I implement features in this codebase?", read this file.
+
+---
+
+## Sweep Summary (v3.9 changelog detail)
+
+Round-3 deltas (v3.8 → v3.9) now reflected:
+- **Audio file format switched MP3 → LINEAR16 WAV** end-to-end (Rule 10 narrative, the new "Audio pipeline is LINEAR16/WAV end-to-end" gotcha, the coordination list Storage bucket entry). Google Cloud TTS call uses `audioEncoding: 'LINEAR16'`; bucket holds `.wav` files.
+- **pg_boss configuration inviolable rule** (`{ supervise: false, schedule: false }`) named in Rule 10 and in a new dedicated gotcha. Verified in `spike-records/round-3/findings-pg_boss.md`.
+- **`audio-render-worker` reframed as a scheduled Supabase Edge Function** (corrects v3.8 Setup Notes that said it was a separately-deployed runtime). Confirmed empirically by the round-3 spike.
+- **`pgboss-maintain`** scheduled Edge Function added to the coordination list and Setup Notes (hourly `boss.maintain()` call).
+- **Three-version Storage retention** (was two) named in Rule 10 and the coordination list.
+- **FR-WD-21 two-layer deduplication** gotcha added (client-side 60s disable + server-side job check inside `enqueue-render-job`).
+- **FR-WD-19 cross-reference corrected** in Rule 11 — the audio-toggle reference now points at FR-WD-22 and §5.2 (FR-WD-19 was renumbered to HTTPS in round 2).
+- **Operator-practice note** added to Rule 11: PRD §11.2 item 9 names the verify-`audio_render_status`-before-service practice; FR-WD-13 global failed-render indicator is the surface.
+- **Staging environment setup** added to Setup Notes: two Supabase projects, two Vercel targets, six Sentry DSNs, with ordering dependencies named (and Data-Arch §12 cross-referenced).
+- **Reg 13(4) frequency-range empirically verified** (no longer a pre-deployment blocker) — named in Rule 10.
 
 ---
 
