@@ -1,11 +1,21 @@
 # Product Requirements Document (PRD)
 # Passenger Display System (PDS)
 
-**Version:** 3.8
+**Version:** 3.9
 **Last Updated:** May 2026
 **Status:** Pre-Development
 
 ## Changelog
+
+### v3.9 (May 2026 — round 3, item 2 of 4)
+Round-3 post-adversarial-review re-planning pass, item 2 of 4 (audio pipeline tightening). The two empirically-verified findings from the round-3 verification spike (`spike-records/round-3/`) — pg_boss-in-Edge-Functions and Reg 13(4) frequency verification — are encoded as inviolable architecture rules (referenced from PRD) and as a settled compliance position (Compliance Matrix updates) respectively. Five smaller audio-pipeline gaps from `adversarial-review.md` (findings 5, 11, 12, 20) and the spike-derived LINEAR16/WAV correction are addressed.
+- FR-WD-12: Return-route audio-render enqueue obligation made explicit. The dashboard's "Generate return route" Server Action MUST call `enqueue-render-job` for the newly-generated return route; the same applies on "Re-generate return route." Addresses round-3 finding 11.
+- FR-WD-13: Added a persistent **global failed-render indicator** in the dashboard's top navigation (visible cross-page, dismissible per-route only) so an operator not currently viewing the route list cannot miss a failed render. Addresses round-3 finding 5's "operator may not notice for 14+30 minutes" failure mode.
+- FR-WD-20: Audio format switched to **LINEAR16 / 24 kHz mono (WAV container)** end-to-end. MP3 is not used. Pre-rendered Storage path file extensions `.mp3` → `.wav`. References pg_boss runtime guardrails (`{ supervise: false, schedule: false }` + hourly `pgboss-maintain`) as inviolable architecture, citing the round-3 spike findings.
+- FR-WD-21: Two-layer deduplication added. Client-side: the Re-Render button is disabled with a spinner for 60 seconds after click and re-enables only when the route's `audio_render_status` flips to `ok` or `failed`. Server-side (authoritative): `enqueue-render-job` checks pg_boss for an existing `created` or `active` job at the same `(route_id, route_version)` and short-circuits to the existing job ID if one exists. Suppresses the redundant-FCM-dispatch behaviour named in round-3 finding 20.
+- FR-AT-22, FR-AT-23, FR-AT-24, FR-AT-25, FR-AT-26, FR-AT-28: Every audio file reference updated from `.mp3` to `.wav`; FR-AT-28 acknowledges the larger WAV file size and the Reg 13(4) preservation rationale.
+- §11.2 Dependencies: Google Cloud TTS bullet updated with the LINEAR16 / 24 kHz / WAV output format and revised Storage size implications (≈ 2.6 MB per single-version 10-stop route, ≈ 8 MB steady-state with 3-version retention).
+- §13 Risks: New row covering "terminal audio-render failure removes an edited route from service for the duration of operator inattention" with the compound fleet-blocked window quantified and mitigations linked (FR-WD-13 global indicator, FR-WD-21 recovery action, operator practice).
 
 ### v3.8 (May 2026 — item 3 of 4)
 Round-2 post-adversarial-review re-planning pass, item 3 of 4 (missing-detail fixes and small bugs).
@@ -254,9 +264,11 @@ Operators can edit existing routes (rename, reorder stops, add/remove stops, cha
 **FR-WD-12: Return Route Generation**
 When saving a route, the dashboard offers a "Generate return route" action that creates a separate route entity with the same stops in reverse order and the direction label flipped. The two routes are linked via `return_route_id` so each can navigate to its counterpart. The two routes can be edited independently after generation.
 
+**Return-route audio enqueue obligation (initial generation).** After the return-route entity is created via `replace_route_with_stops`, the dashboard's Server Action **MUST** call `enqueue-render-job` (Data Architecture §4.6) for the new return route's ID at its freshly-stamped `updated_at`, exactly as the route-save action does for the source route. The return route's `audio_render_status` follows the same `pending → ok | failed` lifecycle, and its journey-start audio gate stays closed until the render completes successfully. Without this explicit enqueue, the return route would remain in `audio_render_status = 'pending'` indefinitely.
+
 **Return-route divergence detection (structural — `stops_content_hash`):** Once a return route has been generated and either route is subsequently edited, the routes may diverge structurally (stops added, removed, or reordered). The detection mechanism compares **structural content**, not timestamps. Each route carries a `stops_content_hash` — SHA-256 of the canonical serialisation of its ordered stop list (see Data Architecture §2.4 and §4.4) — maintained by the `replace_route_with_stops` RPC on every save. A direction-label tweak, `route_number` change, or any other non-stop edit produces the same hash and does **not** fire the warning. A stop add/remove/reorder produces a different hash and **does** fire it.
 
-On the dashboard, when an operator saves an edit to a route that has a `return_route_id` AND the route's `stops_content_hash` no longer matches the linked return's `stops_content_hash` after reverse-order normalisation (i.e. the route's hash differs from the hash of the linked return's stops in reversed order — what the return *should* be), the dashboard displays a warning: *"This route has a linked return route that may now be divergent. [Re-generate return route] [Keep existing return]."* Choosing [Re-generate] replaces the linked return route's stop list with the current route's stops in reverse order, recomputes `stops_content_hash` on both routes (via `replace_route_with_stops`), resets `last_synced_with_return` to `now()` on both routes for the audit trail, and triggers audio re-rendering for the return route. Choosing [Keep existing return] dismisses the warning without further action. This is a warning-and-regenerate mechanism, not a diff UI. The operator is responsible for reviewing the linked route if they choose to keep it.
+On the dashboard, when an operator saves an edit to a route that has a `return_route_id` AND the route's `stops_content_hash` no longer matches the linked return's `stops_content_hash` after reverse-order normalisation (i.e. the route's hash differs from the hash of the linked return's stops in reversed order — what the return *should* be), the dashboard displays a warning: *"This route has a linked return route that may now be divergent. [Re-generate return route] [Keep existing return]."* Choosing [Re-generate] replaces the linked return route's stop list with the current route's stops in reverse order, recomputes `stops_content_hash` on both routes (via `replace_route_with_stops`), resets `last_synced_with_return` to `now()` on both routes for the audit trail, and **explicitly calls `enqueue-render-job` for the return route's ID at its newly-stamped `updated_at`** to enqueue an audio re-render for the regenerated return route. (Audio rendering is fired by `enqueue-render-job`, not by any database trigger — the dashboard's Server Action owns the enqueue, in parity with the route-save path. See Data Architecture §4.6.) Choosing [Keep existing return] dismisses the warning without further action. This is a warning-and-regenerate mechanism, not a diff UI. The operator is responsible for reviewing the linked route if they choose to keep it.
 
 **Why structural, not timestamp-based.** The previous mechanism compared `updated_at > last_synced_with_return`. Because the `routes` `updated_at` trigger fires on every UPDATE — including a trivial direction-label tweak — the warning would fire on every save after generation, producing warning fatigue and training operators to dismiss it without reading. The `stops_content_hash` mechanism fires only when the divergence is real. The `last_synced_with_return` column is retained as a soft audit timestamp (when was the return last reconciled?) but is no longer the divergence trigger.
 
@@ -269,6 +281,8 @@ The dashboard provides a list of all routes belonging to the operator, with name
 - `failed` — red "Audio render failed" pill. The badge is clickable and reveals the `audio_render_error` text from the route row for diagnostic purposes. A "Re-render audio" action (FR-WD-21) appears on the row, which re-enqueues the render job for the route's current version.
 
 The dashboard may use Supabase Realtime to subscribe to `routes` updates so the status updates without a manual refresh; if Realtime is not wired up in the initial release, a manual page refresh is acceptable and the change is visible on next load.
+
+**Global failed-render indicator (cross-page).** A persistent badge in the dashboard's top navigation — visible on every page, not only the route list — shows the count of routes currently in `audio_render_status = 'failed'` for the authenticated operator. The badge is clickable and links to a filtered route list showing only failed routes. **It is dismissible per-route only**: clicking "Re-render audio" on a route (FR-WD-21), or an explicit per-row "Acknowledge" action, removes that route from the count once its `audio_render_status` flips to `pending` or `ok`. The badge **cannot** be hidden globally; an operator browsing other dashboard pages (devices, fleet view, account) cannot miss it. This addresses the round-3 finding that a route in terminal-failed state takes the route out of service for the entire fleet for the duration of operator inattention (see §13 Risks for the compound-failure-mode quantification). The badge does **not** fire push notifications, email, or other external alerts — those remain deferred scope; the rule is in-dashboard prominence only.
 
 ### 3.3 Device Management
 
@@ -303,9 +317,13 @@ When an operator saves a route (create or modify), the dashboard enqueues a `ren
 - Route announcement: "This bus is the [Route Name] service to [Final Stop]."
 - Per-stop next-stop announcement for each stop N: "Next stop: [Stop Name]."
 
-**TTS provider (locked):** Google Cloud Text-to-Speech, voice `en-GB-Neural2-B`. The voice is **not** configurable per operator, per route, or per deployment. Changing it requires re-running the Reg 13(4) frequency verification (see Compliance Mapping Matrix) and is therefore a deliberate compliance event. This is an inviolable architectural rule.
+**TTS provider (locked):** Google Cloud Text-to-Speech, voice `en-GB-Neural2-B`. The voice is **not** configurable per operator, per route, or per deployment. Reg 13(4) frequency verification for this voice has been completed empirically — see Compliance Mapping Matrix Reg 13(4) and `spike-records/round-3/findings-tts-frequency.md` (66.67 % of spectral energy survives a 300 Hz hi-pass, formant-zone share 41.79 %, smoothed upper audible cutoff 3 451 Hz). Changing the voice would require re-running this verification and is therefore a deliberate compliance event. This is an inviolable architectural rule.
 
-**Version-keyed Storage paths.** Each route save produces a fresh `routes.updated_at` (the route version) and therefore a fresh Storage path prefix `{operator_id}/{route_id}/{route_version}/...mp3` (see Data Architecture §2.7). Concurrent saves cannot race on the same path by construction. The daily Storage cleanup job retains the two most recent versions per route.
+**Audio format (locked):** the renderer requests `audioEncoding: 'LINEAR16'`, `sampleRateHertz: 24000` from Google Cloud TTS, mono, and stores the result as a canonical PCM WAV file (`.wav`, 44-byte RIFF header + raw 16-bit signed little-endian samples). **MP3 is not used at any stage of the pipeline** — psychoacoustic compression would discard sub-300 Hz fundamental energy and parts of the formant zone (see `spike-records/round-3/findings-tts-frequency.md` and Compliance Mapping Matrix Reg 13(4)). LINEAR16/WAV is preserved end-to-end through Storage, sync, and tablet playback (Android `MediaPlayer` plays WAV files natively). The format choice is part of the Reg 13(4) compliance argument, not just an implementation detail.
+
+**pg_boss runtime guardrails (inviolable architecture).** The `audio-render-worker` Edge Function (and `pgboss-maintain`, and any other Edge Function that instantiates pg_boss) **MUST** construct pg_boss with `{ supervise: false, schedule: false }`. A separate scheduled Edge Function `pgboss-maintain` runs `boss.maintain()` hourly (`cron: '0 * * * *'`) to replace the supervision loop's archival/expiry duties. These two rules are non-negotiable — without them the audio pipeline malfunctions silently in the Deno Edge Function runtime. See Data Architecture §4.6 for rationale and empirical basis (`spike-records/round-3/findings-pg_boss.md`).
+
+**Version-keyed Storage paths.** Each route save produces a fresh `routes.updated_at` (the route version) and therefore a fresh Storage path prefix `{operator_id}/{route_id}/{route_version}/...wav` (see Data Architecture §2.8). Concurrent saves cannot race on the same path by construction. The daily Storage cleanup job retains the three most recent versions per route.
 
 **Differential re-rendering via content hashes.** Each rendered audio file has an associated content hash recorded on the database (`route_stops.audio_content_hash`; `routes.audio_announcement_hash`). On re-render, the worker computes the would-be hash for each piece of text and only re-renders stops whose hash has changed. Files whose text is unchanged are server-side-copied from the previous route version's Storage path into the new version's path, so a direction-label-only edit (which changes no announcement text) calls Google TTS zero times. This keeps per-edit TTS cost proportional to the number of stops whose text actually changed.
 
@@ -319,6 +337,12 @@ When an operator saves a route (create or modify), the dashboard enqueues a `ren
 
 **FR-WD-21: Re-Render Audio Action**
 Each route in the route list (FR-WD-13) offers a "Re-render audio" action. Clicking it calls `enqueue-render-job` with the route's current `updated_at` as `route_version`, pushing a fresh job onto the pg_boss queue regardless of the route's current `audio_render_status`. Used to recover from terminal failures (clearing `'failed'` back to `'pending'` and ultimately `'ok'` on success) or to force a re-render after an out-of-band Storage cleanup. The action does **not** modify the route data; it does not bump `updated_at` and does not create a new route version — the render runs against the current version's Storage path.
+
+**Deduplication (two layers).** A rapid double-click would, without these guards, enqueue two jobs at the same route version. The first job would render the audio (or find files already present from a prior render); the second would pass its staleness check (same `routes.updated_at`), find files already present, complete quickly without TTS spend — but each completed job would dispatch FCM, causing redundant tablet syncs (round-3 finding 20). Two-layer dedup prevents this:
+
+1. **Client-side (UX).** The Re-Render button is disabled with a spinner immediately on click for **60 seconds**, and re-enables only when the route's `audio_render_status` flips to `ok` or `failed` (whichever comes first). This is UX prevention; an operator who refreshes the page or opens a second browser tab can still click again.
+
+2. **Server-side (authoritative).** The `enqueue-render-job` Edge Function checks pg_boss for any existing job at the same `(route_id, route_version)` whose state is `created` or `active`. If one exists, the function returns the existing job's ID (with a `dedup: true` flag) **without enqueueing a duplicate**. See Data Architecture §4.6 for the exact query shape. This is the authoritative deduplication; it suppresses the redundant FCM dispatch at the source rather than depending on the client-side disable.
 
 **FR-WD-22: Audio-Designation Warning**
 When an operator toggles `audio_enabled` in the fleet view such that **zero** of their active devices would have `audio_enabled = true`, the dashboard displays a non-blocking warning before saving the change:
@@ -485,7 +509,7 @@ If the app is killed during an active journey (crash, OS kill, unexpected reboot
 
 1. **Staleness — age.** Compute `journey_age = now() - journey_state.journey_started_at`. If `journey_age > JOURNEY_STATE_MAX_AGE_HOURS`: clear journey state (`is_active = false`, clear `journey_skipped_stops`) and return to the route list. Log a `JOURNEY_AUTO_CLEARED` event with `detail = 'stale_age'`.
 2. **Staleness — event silence.** Look up the most recent `journey_events` row with `timestamp_utc >= journey_state.journey_started_at`. If none exists, or its `timestamp_utc` is older than `now() - JOURNEY_EVENT_RECENCY_THRESHOLD_HOURS`: clear journey state as above with `detail = 'stale_no_events'`.
-3. **Diversion replay (if resuming).** If the state passed both staleness checks and `journey_skipped_stops` is non-empty, replay the diversion start announcement (FR-AT-25) — alert chime → visual flash (FR-AT-65) → `diversion_start.mp3` → tube-map strikethrough rendering — *before* re-arming the GPS state machine. This ensures passengers who boarded during or after the crash hear and see the active diversion context. The replay does **not** insert into `journey_skipped_stops` (it is already populated) and does **not** log a new `DIVERSION_STARTED` event; it logs a `DIVERSION_REPLAYED` event with `detail = 'recovery'` for diagnostic clarity.
+3. **Diversion replay (if resuming).** If the state passed both staleness checks and `journey_skipped_stops` is non-empty, replay the diversion start announcement (FR-AT-25) — alert chime → visual flash (FR-AT-65) → `diversion_start.wav` → tube-map strikethrough rendering — *before* re-arming the GPS state machine. This ensures passengers who boarded during or after the crash hear and see the active diversion context. The replay does **not** insert into `journey_skipped_stops` (it is already populated) and does **not** log a new `DIVERSION_STARTED` event; it logs a `DIVERSION_REPLAYED` event with `detail = 'recovery'` for diagnostic clarity.
 4. **Resume.** Re-arm the foreground GPS service and the two-stop look-ahead state machine from the recorded `current_stop_index`. Skip behaviour (FR-AT-13 diversion-skip handling) proceeds as usual since `journey_skipped_stops` is intact.
 
 The two staleness constants and the algorithm are also documented in Data Architecture §5.5 alongside the `journey_state` schema; the FR is the authoritative behavioural spec.
@@ -515,30 +539,30 @@ For routes with more than 10 stops, the view auto-scales: the line shows all sto
 ### 4.5 Audio Announcements
 
 **FR-AT-22: Route and Destination Announcement**
-At the start of a journey and after each stop departure, the app plays the pre-rendered route announcement audio file (`route_announcement.mp3` for the active route, synced from Supabase Storage). The file contains: "This bus is the [Route Name] service to [Final Stop Name]."
+At the start of a journey and after each stop departure, the app plays the pre-rendered route announcement audio file (`route_announcement.wav` for the active route, synced from Supabase Storage). The file contains: "This bus is the [Route Name] service to [Final Stop Name]."
 
 **FR-AT-23: Next Stop Announcement**
-When entering proximity of the next stop (or when the driver manually advances), the app plays the pre-rendered next-stop audio file for that stop (`stop_{N}.mp3` for the active route, synced from Supabase Storage). The file contains: "Next stop: [Stop Name]."
+When entering proximity of the next stop (or when the driver manually advances), the app plays the pre-rendered next-stop audio file for that stop (`stop_{N}.wav` for the active route, synced from Supabase Storage). The file contains: "Next stop: [Stop Name]."
 
 **FR-AT-24: Termination Announcement**
-At the final stop, the app plays the alert chime (Reg 8(2)) followed by the bundled pre-rendered termination audio file (`termination.mp3`), which contains: "This service terminates here. All change, please."
+At the final stop, the app plays the alert chime (Reg 8(2)) followed by the bundled pre-rendered termination audio file (`termination.wav`), which contains: "This service terminates here. All change, please."
 
 **FR-AT-25: Diversion Announcement**
 The driver triggers a diversion announcement via the driver control panel (FR-AT-41).
 
-**Audio:** The app plays the alert chime (Reg 10(2)(b)) followed by the bundled pre-rendered diversion announcement file (`diversion_start.mp3`), which contains: "This service is on diversion. Please check the display for affected stops." This audio is a fixed phrase, consistent across all tablets.
+**Audio:** The app plays the alert chime (Reg 10(2)(b)) followed by the bundled pre-rendered diversion announcement file (`diversion_start.wav`), which contains: "This service is on diversion. Please check the display for affected stops." This audio is a fixed phrase, consistent across all tablets.
 
 **Visual:** The passenger display simultaneously shows which specific stops are being skipped, via the tube-map strikethrough rendering (FR-AT-19). Stop names from `route_stops.stop_name` for each index in `journey_skipped_stops` are shown on-screen with a strikethrough marker. The visual display carries the stop-specific detail that the audio does not name (see Compliance Mapping Matrix Reg 10(1) for the compliance argument).
 
 The driver must first open the diversion stop selector (FR-AT-42) to mark upcoming stops as skipped before triggering the announcement; the audio and visual updates are then triggered together. If no stops are marked, the audio still plays but the visual shows no strikethrough stops.
 
-**Diversion end:** When the driver triggers "Diversion end," the app plays the alert chime followed by the bundled pre-rendered `diversion_end.mp3`: "This service has resumed its normal route." All entries in `journey_skipped_stops` are cleared and the tube-map strikethrough markers are removed.
+**Diversion end:** When the driver triggers "Diversion end," the app plays the alert chime followed by the bundled pre-rendered `diversion_end.wav`: "This service has resumed its normal route." All entries in `journey_skipped_stops` are cleared and the tube-map strikethrough markers are removed.
 
 **FR-AT-26: Hail-and-Ride Announcements**
 Hail-and-ride section start and end announcements are triggered automatically by the GPS state machine when it crosses a segment boundary in the route data (FR-AT-13). All announcements are played from bundled pre-rendered audio files:
 
-- **Section start:** When the GPS state machine announces the last scheduled stop before a hail-and-ride section (i.e., when `segment_type` of the NEXT stop is `hail_and_ride`), it automatically plays: the alert chime (Reg 11(2)(b)) followed by `hail_and_ride_start.mp3` — "You are now entering a hail and ride section. Please signal the driver if you wish to alight."
-- **Section end:** When the GPS state machine detects approach to the first scheduled stop after a hail-and-ride section (i.e., when the current stop's `segment_type` is `scheduled` and the preceding stop's was `hail_and_ride`), it automatically plays: the alert chime (Reg 11(5)(b)) followed by `hail_and_ride_end.mp3` — "You are now leaving the hail and ride section." The `stop_{N}.mp3` announcement for that scheduled stop follows immediately.
+- **Section start:** When the GPS state machine announces the last scheduled stop before a hail-and-ride section (i.e., when `segment_type` of the NEXT stop is `hail_and_ride`), it automatically plays: the alert chime (Reg 11(2)(b)) followed by `hail_and_ride_start.wav` — "You are now entering a hail and ride section. Please signal the driver if you wish to alight."
+- **Section end:** When the GPS state machine detects approach to the first scheduled stop after a hail-and-ride section (i.e., when the current stop's `segment_type` is `scheduled` and the preceding stop's was `hail_and_ride`), it automatically plays: the alert chime (Reg 11(5)(b)) followed by `hail_and_ride_end.wav` — "You are now leaving the hail and ride section." The `stop_{N}.wav` announcement for that scheduled stop follows immediately.
 - **Entire-route hail and ride:** If all stops in the route have `segment_type = 'hail_and_ride'`, the section start announcement fires at journey start (FR-AT-11) before GPS monitoring begins.
 
 The driver control panel (FR-AT-41) retains manual H&R start and end buttons as a fallback for GPS failure or correction. If the driver manually triggers H&R start or end, the state machine behaves as if the corresponding automatic boundary was crossed: H&R start silences subsequent stop announcements; H&R end re-enables them. The manual buttons are available at all times during an active journey.
@@ -547,22 +571,24 @@ The driver control panel (FR-AT-41) retains manual H&R start and end buttons as 
 The alert chime is a bundled audio file (under 1 second) played immediately before termination, diversion, and hail-and-ride announcements. The same chime is used for all four to provide a consistent passenger cue. Next-stop and route-and-destination announcements do NOT have an alert chime.
 
 **FR-AT-28: Audio Playback Engine**
-All tablet audio announcements are played from pre-rendered MP3 files. The tablet does not use the Android TextToSpeech API; on-device TTS is not installed, configured, or used.
+All tablet audio announcements are played from pre-rendered WAV files (LINEAR16 PCM, 24 kHz mono — see Data Architecture §2.8 and FR-WD-20). The tablet does not use the Android TextToSpeech API; on-device TTS is not installed, configured, or used. Android `MediaPlayer` plays WAV files natively, so no client-side audio decoder is required.
 
 There are two categories of audio file:
 
-**Route-specific files** (stored in Supabase Storage; synced to the tablet during route sync — see Data Architecture §2.7 and §6.4):
-- `route_announcement.mp3` — "This bus is the [Route Name] service to [Final Stop]."
-- `stop_{N}.mp3` for each stop N — "Next stop: [Stop Name]."
+**Route-specific files** (stored in Supabase Storage; synced to the tablet during route sync — see Data Architecture §2.8 and §6.4):
+- `route_announcement.wav` — "This bus is the [Route Name] service to [Final Stop]."
+- `stop_{N}.wav` for each stop N — "Next stop: [Stop Name]."
 
 **Bundled files** (packaged in the APK; identical for all operators — see Data Architecture §6.3):
-- `termination.mp3` — "This service terminates here. All change, please."
-- `hail_and_ride_start.mp3` — "You are now entering a hail and ride section. Please signal the driver if you wish to alight."
-- `hail_and_ride_end.mp3` — "You are now leaving the hail and ride section."
-- `diversion_start.mp3` — "This service is on diversion. Please check the display for affected stops."
-- `diversion_end.mp3` — "This service has resumed its normal route."
+- `termination.wav` — "This service terminates here. All change, please."
+- `hail_and_ride_start.wav` — "You are now entering a hail and ride section. Please signal the driver if you wish to alight."
+- `hail_and_ride_end.wav` — "You are now leaving the hail and ride section."
+- `diversion_start.wav` — "This service is on diversion. Please check the display for affected stops."
+- `diversion_end.wav` — "This service has resumed its normal route."
 
 All files are rendered using a single consistent server-side voice at route-save time (FR-WD-20), ensuring that every tablet in the fleet produces identical audio for any given announcement regardless of tablet model or manufacturer.
+
+**File size note (LINEAR16 vs MP3).** WAV files are ≈ 10× larger than quality-equivalent MP3 (e.g. ~240 KB per 5-second stop announcement vs ~25 KB MP3). The trade-off is deliberate: LINEAR16 preserves the full audio spectrum required by Reg 13(4) (Compliance Mapping Matrix and `spike-records/round-3/findings-tts-frequency.md`) with no lossy compression at any stage of the pipeline. Storage size and sync-bandwidth implications are quantified in Data Architecture §2.8.
 
 **Journey-start gating:** Before enabling the "Start Journey" button for a route, the app verifies that all expected audio files for that route are present in local storage. If any are missing (route newly synced, server-side rendering still in progress, or interrupted download), the route is shown with an "Audio not ready — syncing" indicator and cannot be started. This is a clear error state; there is no fallback to on-device TTS.
 
@@ -1021,7 +1047,8 @@ The product is built as a single coherent release. The MoSCoW list below describ
 - Edge Functions for `pair-device`, `recover-device`, and `generate-pairing-code`
 - pg_boss-backed audio render pipeline: `enqueue-render-job` (called by the dashboard on save) and `audio-render-worker` (scheduled every minute) — see FR-WD-20 and Data Architecture §4.6
 - Locked Google Cloud Text-to-Speech voice `en-GB-Neural2-B` for all server-rendered announcement audio
-- Supabase Storage bucket `route-audio` with version-keyed paths for per-route pre-rendered audio files; daily `audio-cleanup-worker` retains two most-recent versions
+- Supabase Storage bucket `route-audio` with version-keyed paths for per-route pre-rendered audio files (LINEAR16 PCM, 24 kHz mono, WAV container); daily `audio-cleanup-worker` retains the three most-recent versions
+- `pgboss-maintain` scheduled Edge Function running `boss.maintain()` hourly — required because `audio-render-worker` instantiates pg_boss with `{ supervise: false, schedule: false }` (an inviolable architecture rule; see FR-WD-20 and Data Architecture §4.6)
 - `audio_render_status` / `audio_render_error` / per-stop and per-route content-hash columns surfacing render outcome on the dashboard route list
 - Server-side timestamp triggers
 - Atomic route + stops upsert RPC
@@ -1114,7 +1141,7 @@ The detailed clause-by-clause mapping is provided in the Compliance Mapping Matr
 
 1. **Google Play Services** — required for FusedLocationProviderClient and FCM.
 2. **Supabase** — backend for auth, database, Edge Functions, Storage, and FCM relay. Subject to Supabase's SLA.
-3. **Google Cloud Text-to-Speech (locked)** — used by the `audio-render-worker` Edge Function (see Data Architecture §4.6) to render announcement audio server-side. **Voice is locked to `en-GB-Neural2-B`.** This is a hard external dependency with metered API costs (approximately $16 per 1M characters as of late 2025; a typical 10-stop route's first full render costs ~$0.004, and edits typically cost fractions of a cent thanks to content-hash differential rendering). The system administrator owns the GCP project and the restricted API key. Sustained Google TTS outages or quota breaches will surface as `audio_render_status = 'failed'` on the dashboard. The tablet has no TTS dependency.
+3. **Google Cloud Text-to-Speech (locked)** — used by the `audio-render-worker` Edge Function (see Data Architecture §4.6) to render announcement audio server-side. **Voice is locked to `en-GB-Neural2-B`; output format is LINEAR16 / 24 kHz mono (WAV container).** Reg 13(4) frequency verification is complete (Compliance Mapping Matrix and `spike-records/round-3/findings-tts-frequency.md`); the LINEAR16/WAV pipeline preserves the verified spectrum end-to-end (no MP3 or other lossy compression anywhere). This is a hard external dependency with metered API costs (approximately $16 per 1M characters as of late 2025; a typical 10-stop route's first full render costs ~$0.004, and edits typically cost fractions of a cent thanks to content-hash differential rendering). The system administrator owns the GCP project and the restricted API key. Sustained Google TTS outages or quota breaches will surface as `audio_render_status = 'failed'` on the dashboard. The tablet has no TTS dependency. **Storage size implications (v3.9):** a 10-stop route's single-version audio is ≈ 2.6 MB (vs ≈ 220 KB at the previous MP3 spec); with the 3-version retention policy (Data Architecture §4.7), steady-state per-route Storage is ≈ 8 MB. Acceptable on cellular WAN given how infrequently routes are edited.
 4. **Vercel** — dashboard hosting. Subject to Vercel's free-tier limits.
 5. **Next.js** — dashboard framework.
 6. **NaPTAN open data** — published by the Department for Transport under UK Open Government Licence.
@@ -1154,6 +1181,7 @@ The detailed clause-by-clause mapping is provided in the Compliance Mapping Matr
 | Dashboard service disruption | Cannot manage routes or pair new devices | Low | Tablets continue operating from cached data |
 | Operator subscribes via self-signup but has no intention of paying | Wasted resources, system abuse | Medium | Manual approval gate before any tablet functions |
 | Google Cloud TTS outage or API quota breach | Render jobs fail; new/edited routes show `audio_render_status='failed'` on the dashboard; tablets cannot start journeys on those routes (journey-start gate blocks) | Low | pg_boss retries with exponential backoff cover transient outages (5 retries: 30s, 60s, 120s, 240s, 480s). Sustained outages surface clearly on the dashboard for operator escalation rather than silently failing. Locked voice means no fallback voice substitution — degraded output never ships in place of the verified voice. The "Re-render audio" action (FR-WD-21) recovers transient terminal failures once Google TTS is healthy again. |
+| Terminal audio-render failure removes an edited route from service for the entire fleet for the duration of operator inattention | High — drivers on the affected route cannot start a journey (journey-start audio gate is closed by `audio_render_status = 'failed'`). Total fleet-blocked window: up to ~14 minutes pg_boss retries (5 attempts at 30s/60s/120s/240s/480s) + up to ~30 minutes WorkManager periodic sync propagation + however long until the operator notices + one render cycle. Worst case for a route edited Sunday evening with operator off-duty: a Monday-morning service runs without that route until the operator wakes up and re-renders. | Low — pg_boss retries cover transient TTS API issues; only persistent TTS failures or quota exhaustion produce terminal `failed` state | Multi-layer mitigation: (1) per-route red badge on the dashboard route list with the captured error message (FR-WD-13). (2) **Persistent global failed-render indicator** in the dashboard's top navigation, visible cross-page, dismissible only per-route (FR-WD-13 v3.9 addition). (3) `Re-render audio` action (FR-WD-21) is the operator recovery mechanism once the underlying TTS issue is resolved. (4) Operator practice: treat route edits made shortly before a service as a non-emergency action — verify audio readiness on the dashboard before drivers board. There is no driver-side recovery path (silent operation would be a Reg 12(1)(b) compliance failure) and no email/push alerting in the initial release; in-dashboard prominence is the operator-facing signal. |
 
 ---
 

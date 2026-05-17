@@ -1,11 +1,23 @@
 # Data Architecture Document
 # Passenger Display System (PDS)
 
-**Version:** 3.8
+**Version:** 3.9
 **Last Updated:** May 2026
-**PRD Alignment:** PRD v3.8
+**PRD Alignment:** PRD v3.9
 
 ## Changelog
+
+### v3.9 (May 2026 — round 3, item 2 of 4)
+Round-3 post-adversarial-review re-planning pass, item 2 of 4 (audio pipeline tightening). The two empirically-verified findings from the round-3 spike (`spike-records/round-3/`) — pg_boss-in-Edge-Functions and the Reg 13(4) frequency verification — are encoded as inviolable architecture rules and as a settled compliance position respectively. Five smaller audio-pipeline gaps from `adversarial-review.md` (findings 5, 11, 12, 20) and one spike-derived correction (LINEAR16 vs MP3) are addressed.
+- §2.7/§2.8: Audio format switched end-to-end from MP3 (22.05 kHz, ~32 kbps) to LINEAR16 PCM (24 kHz, mono, WAV container). Reason: MP3's psychoacoustic compression discards sub-300 Hz fundamental and parts of the formant zone; LINEAR16 preserves the Reg 13(4)-verified spectrum (Compliance Matrix §13(4)). Storage path file extensions `.mp3` → `.wav`. Storage size estimates revised: ≈ 240 KB per 5 s stop announcement (vs ~25 KB MP3); 10-stop route per version ≈ 2.6 MB; steady-state per route with 3-version retention ≈ 8 MB.
+- §4.4: The dashboard's "Generate return route" Server Action explicitly enqueues an audio render job for the new return route via `enqueue-render-job` (parity with route-save), addressing round-3 finding 11.
+- §4.6: pg_boss runtime configuration `{ supervise: false, schedule: false }` promoted to an **inviolable architectural rule** with empirical basis in `spike-records/round-3/findings-pg_boss.md`. A new scheduled Edge Function `pgboss-maintain` (`cron: '0 * * * *'`) runs `boss.maintain()` hourly to replace the supervision loop's archival/expiry duties. TTS API call updated to `audioEncoding: 'LINEAR16'`, `sampleRateHertz: 24000`. Target Storage path file extension `.wav`. `enqueue-render-job` gains a server-side deduplication step (FR-WD-21): if a `created` or `active` pg_boss job already exists for the same `(route_id, route_version)`, the function returns the existing job ID without enqueueing a duplicate (suppresses the redundant FCM dispatch named in round-3 finding 20).
+- §4.7: Storage cleanup retains **three** most-recent versions per route, up from two (round-3 finding 12). Rationale: covers rapid "edit, notice mistake, edit again" iteration within a single cleanup cycle. Residual assumption (more than 3 versions iterated within a 24-hour cycle produces transient `AUDIO_FILE_MISSING` on tablets holding an intermediate version, self-heals on next sync) named explicitly.
+- §5.1, §6.3, §6.4, §7.x, §8.3, §8.4: Audio file extension `.mp3` → `.wav` throughout (Room hash-column descriptions, bundled APK asset table, local file storage layout, sync download prose, announcement flow diagrams, data-flow diagram).
+- §6.3 bundled-asset table: file sizes revised for LINEAR16/WAV (≈ 10× larger than MP3). Note added that bundled re-rendering is a Stage 2 build task using the same `en-GB-Neural2-B` / LINEAR16 / 24 kHz configuration as `audio-render-worker`; this section specifies the spec, not the build.
+- §10 retention table: "Two most-recent versions" → "Three most-recent versions" (cross-references §4.7).
+- §11.2: LINEAR16 / 24 kHz / WAV output note added under Google Cloud TTS dependency; cites Reg 13(4) preservation rationale.
+- §12 setup checklist: `pgboss-maintain` (`0 * * * *`) added to step 5 alongside `audio-render-worker` and `audio-cleanup-worker`. Step 6 (Reg 13(4) verification) updated to record the verification as already complete (see `spike-records/round-3/findings-tts-frequency.md` and Compliance Matrix §13(4)); no pre-deployment voice verification work remains.
 
 ### v3.8 (May 2026 — item 3 of 4)
 Round-2 post-adversarial-review re-planning pass, item 3 of 4 (missing-detail fixes and small bugs).
@@ -232,7 +244,7 @@ Route definitions. Each route belongs to one operator. Routes are authored exclu
 | is_deleted | BOOLEAN | NOT NULL, DEFAULT false | Soft delete flag. Deleted routes remain for sync propagation. |
 | audio_render_status | TEXT | NOT NULL, DEFAULT 'pending', CHECK (audio_render_status IN ('pending', 'ok', 'failed')) | Current state of the audio render job for this route version. `pending` immediately after `replace_route_with_stops`. Flipped to `ok` by the audio render worker on successful completion (§4.6); flipped to `failed` after the worker exhausts its retries. The dashboard surfaces this status in the route list (PRD FR-WD-13); the tablet uses it to skip audio download for failed routes (§7.4). |
 | audio_render_error | TEXT | NULLABLE | Last error message captured when `audio_render_status = 'failed'`. NULL when status is `pending` or `ok`. Cleared back to NULL by the worker on a successful re-render. Surfaced on the dashboard for diagnostic purposes. |
-| audio_announcement_hash | TEXT | NULLABLE | SHA-256 hex of the route-announcement text (`"This bus is the [route.name] service to [last_stop.stop_name]."`) that was rendered into the currently-stored `route_announcement.mp3`. Compared by the audio render worker against the would-be hash on re-render to skip rendering when unchanged. NULL until the first successful render of this route. See §4.6 for the differential re-render algorithm. |
+| audio_announcement_hash | TEXT | NULLABLE | SHA-256 hex of the route-announcement text (`"This bus is the [route.name] service to [last_stop.stop_name]."`) that was rendered into the currently-stored `route_announcement.wav`. Compared by the audio render worker against the would-be hash on re-render to skip rendering when unchanged. NULL until the first successful render of this route. See §4.6 for the differential re-render algorithm. |
 
 **Indexes:** `(operator_id, is_deleted, updated_at)` composite for sync queries.
 
@@ -253,7 +265,7 @@ Ordered list of stops within a route. Stops are always synced as a complete set 
 | is_custom | BOOLEAN | NOT NULL, DEFAULT false | False in the initial release. Reserved for the future custom-stop feature. |
 | proximity_radius_meters | INTEGER | NOT NULL, DEFAULT 200 | Per-stop GPS proximity radius in metres. The app triggers a stop announcement when a qualifying GPS fix places the bus within this radius. Set per stop in the dashboard route builder; 200m is the pre-filled default. Operators can set a larger value for motorway stops or a smaller value for dense urban stops. |
 | segment_type | TEXT | NOT NULL, DEFAULT 'scheduled', CHECK (segment_type IN ('scheduled', 'hail_and_ride')) | The stop's segment classification. 'scheduled' for a normal timetabled stop; 'hail_and_ride' for a stop within a hail-and-ride section. A contiguous run of 'hail_and_ride' stops constitutes a hail-and-ride section. Set per stop in the dashboard route builder; 'scheduled' is the pre-filled default. |
-| audio_content_hash | TEXT | NULLABLE | SHA-256 hex of the per-stop announcement text (`"Next stop: [stop.stop_name]."`) that was rendered into the currently-stored `stop_{stop_order}.mp3` for this stop. Used by the audio render worker to skip re-rendering when the stop's text has not changed (§4.6 differential re-render). NULL until this stop has been successfully rendered at least once. |
+| audio_content_hash | TEXT | NULLABLE | SHA-256 hex of the per-stop announcement text (`"Next stop: [stop.stop_name]."`) that was rendered into the currently-stored `stop_{stop_order}.wav` for this stop. Used by the audio render worker to skip re-rendering when the stop's text has not changed (§4.6 differential re-render). NULL until this stop has been successfully rendered at least once. |
 
 **Indexes:** `route_id` (for loading all stops for a route).
 
@@ -321,13 +333,13 @@ start/end) are bundled in the APK and are not stored here.
 
 | Path | Content |
 |---|---|
-| `{operator_id}/{route_id}/{route_version}/route_announcement.mp3` | "This bus is the [Route Name] service to [Final Stop]." |
-| `{operator_id}/{route_id}/{route_version}/stop_{stop_order}.mp3` | "Next stop: [Stop Name]." for stop at position N |
+| `{operator_id}/{route_id}/{route_version}/route_announcement.wav` | "This bus is the [Route Name] service to [Final Stop]." |
+| `{operator_id}/{route_id}/{route_version}/stop_{stop_order}.wav` | "Next stop: [Stop Name]." for stop at position N |
 
 `route_version` is `routes.updated_at` expressed as epoch milliseconds (e.g. `1715846400000`).
 Each route save produces a freshly-stamped `updated_at` (via the trigger in §3.5) and therefore
 a fresh path prefix. Stop order values match `route_stops.stop_order` (0-based). A 10-stop route
-produces 11 files per version: one route announcement plus `stop_0.mp3` through `stop_9.mp3`.
+produces 11 files per version: one route announcement plus `stop_0.wav` through `stop_9.wav`.
 
 **Race-safety by construction:** Two concurrent saves cannot collide on the same Storage path
 because each save yields a different `updated_at`. The newer save enqueues its own render job;
@@ -339,13 +351,25 @@ files only under `{their_operator_id}/`. Dashboard users may read files under th
 `{operator_id}/`. Write operations are performed by the `audio-render-worker` Edge Function
 (§4.6) running with service-role access.
 
-**Audio format:** MP3, mono, 22.05kHz sample rate, ~32kbps. Sufficient quality for spoken
-announcements; ~20KB per 5-second file.
+**Audio format:** LINEAR16 (uncompressed PCM, 16-bit signed little-endian), mono, 24 kHz
+sample rate, encapsulated in a canonical PCM WAV container (44-byte header). Chosen end-to-end
+to preserve the full frequency spectrum verified for Reg 13(4) (`spike-records/round-3/findings-tts-frequency.md`
+and Compliance Mapping Matrix Reg 13(4)). MP3 was previously specified but its psychoacoustic
+compression aggressively discards sub-300 Hz energy (loudness contour) and parts of the formant
+zone; LINEAR16 has no such loss. The format choice is therefore part of the compliance argument,
+not just an implementation detail. Android `MediaPlayer` plays WAV files natively — no
+client-side decoder change is required.
 
-**Storage size estimate:** A 10-stop route produces approximately 220KB of audio per version.
-With the two-version retention policy (§4.7), the steady-state Storage footprint per route is
-approximately 2× a single version. Audio file sync adds negligible bandwidth relative to the
-route data itself.
+**Storage size estimate:** A 5-second stop announcement at LINEAR16 mono 24 kHz is
+24000 × 2 × 5 = **240 KB** per file (≈ 10× a comparable MP3). A 10-stop route therefore
+produces ≈ 11 × 240 KB ≈ **2.6 MB of audio per version** (vs ~220 KB at the previous MP3
+spec). With the **three-version** retention policy (§4.7), the steady-state Storage footprint
+per route is approximately 3 × one version ≈ 8 MB. The cost is one-off sync bandwidth on
+route changes, not ongoing operation: tablets on cellular WAN with version-keyed sync (each
+route fetches audio only when its `route_version` advances) absorb this easily given how
+infrequently routes are edited. The trade-off — ~10× the previous Storage footprint per
+route — buys a structurally compliant audio path (no lossy compression between the
+Reg 13(4)-verified renderer and the tablet speaker).
 
 **Lifecycle:**
 - **Created:** When the dashboard saves a route, it enqueues a `render-route-audio` pg_boss job
@@ -357,7 +381,7 @@ route data itself.
   syncing the updated route pull audio from the new path; tablets that already have the
   previous version's audio downloaded are unaffected until they next sync.
 - **Cleaned:** A daily scheduled cleanup job (`audio-cleanup-worker`, §4.7) removes all but
-  the two most-recent versions per route.
+  the three most-recent versions per route.
 - **Deleted:** If a route is ever hard-deleted (a manual administrative action; the initial
   release does not perform scheduled hard deletes — see §10 data retention), the entire
   `{operator_id}/{route_id}/` folder — every version — is removed from the bucket.
@@ -672,13 +696,24 @@ the render to complete. The route appears in the route list immediately with
 `audio-render-worker` processes the job. The dashboard does **not** fire any FCM push on save —
 FCM dispatch is the render worker's responsibility on successful completion (§4.6 and §8.4).
 
+**Audio rendering on return-route generation and re-generation (PRD FR-WD-12).** The
+dashboard's "Generate return route" Server Action creates the return route entity by calling
+`replace_route_with_stops` for the new route, then **must explicitly call `enqueue-render-job`
+for the new return route's ID at its newly-stamped `updated_at`** — exactly as the route-save
+path does for the source route. The same obligation applies on "Re-generate return route": after
+`replace_route_with_stops` has updated the existing return route's stops, the Server Action
+must call `enqueue-render-job` for that route. Without the explicit enqueue, the return route
+would carry `audio_render_status = 'pending'` indefinitely and its journey-start gate would
+remain closed. Server-side deduplication in `enqueue-render-job` (§4.6) guarantees that a
+duplicate enqueue from a quick double-save is harmless.
+
 ### 4.6 Audio Render Job (pg_boss queue + scheduled worker)
 
 Audio rendering runs as a **pg_boss-backed job**, not as a synchronously-invoked Edge Function.
 This section specifies the queue, the enqueue path, the worker, and the per-job processing
 algorithm. The job replaces the previous `render-route-audio` Edge Function (removed in v3.8);
-the *output* is unchanged (pre-rendered MP3 files in Supabase Storage) but the production
-mechanism is asynchronous, retryable, idempotent, and observable.
+the *output* is unchanged (pre-rendered WAV files (LINEAR16 PCM) in Supabase Storage — see §2.8)
+but the production mechanism is asynchronous, retryable, idempotent, and observable.
 
 **Why pg_boss.** A Postgres-backed job queue gives us durability, retry, and backoff with no
 new infrastructure: pg_boss creates its own tables inside the existing Supabase Postgres
@@ -686,6 +721,51 @@ database. There is no separate queue service to deploy or pay for. The trade-off
 runs as a scheduled Edge Function rather than a long-running consumer — is acceptable for the
 initial release's expected queue depth (a single operator may save a handful of routes per
 week; even at 100 operators that is tens of jobs per day).
+
+#### INVIOLABLE RULE — pg_boss configuration in Edge Function isolates
+
+The `audio-render-worker` Edge Function (and the `pgboss-maintain` function below, and any
+other Edge Function that instantiates pg_boss) **MUST** construct pg_boss with
+`{ supervise: false, schedule: false }`:
+
+    const boss = new PgBoss({
+      connectionString: Deno.env.get('SUPABASE_DB_URL'),
+      supervise: false,
+      schedule: false,
+    });
+
+This is non-negotiable. pg_boss's defaults (`supervise: true`, `schedule: true`) start an
+in-process supervision loop and a scheduling timer that both assume a long-lived consumer.
+In a short-lived Deno isolate the timers fire after the request handler has returned, race
+the runtime's wall-clock termination, leak handles, and can leave partially-committed work.
+With `{ supervise: false, schedule: false }` pg_boss runs as a pure DB-driven state machine:
+`fetch`, `complete`, `fail`, and `maintain` are explicit operations rather than
+side-effects of a supervisor loop. The retry state machine still works correctly across
+isolates because it is database-driven (`pgboss.job.state` + `retry_count`).
+
+This was verified empirically in the round-3 spike (`spike-records/round-3/findings-pg_boss.md`).
+The spike measured 50 ms cold start, 8–14 ms warm, ~5 ms `boss.maintain`, and the full
+retry lifecycle across three short-lived invocations. The defaults produced exactly the
+"leaked timer" symptoms the rule prevents.
+
+#### Maintenance: `pgboss-maintain` scheduled Edge Function
+
+Because `supervise: false` disarms pg_boss's internal maintenance loop, archive/expiry and
+dead-job-recovery duties must be driven externally. A small scheduled Edge Function
+`pgboss-maintain` runs `await boss.maintain()` on `cron: '0 * * * *'` (top of every hour):
+
+    // pgboss-maintain Edge Function — runs at 0 * * * *
+    const boss = new PgBoss({ connectionString: ..., supervise: false, schedule: false });
+    await boss.start();
+    await boss.maintain();
+    await boss.stop();
+
+The function does ~5 ms of real work per tick (mostly idle wall-clock) and ~50 ms on a cold
+start. It shares the scheduled-function infrastructure that already runs the daily 03:00 UTC
+cleanup (`audio-cleanup-worker`, `rate_limit_attempts` cleanup, 60-day device
+auto-deregistration), but on its own hourly schedule rather than colocated with the daily
+job — `boss.maintain()` is the only call it makes, and the hourly cadence bounds active-job
+visibility timeouts at ~1 hour.
 
 #### Installation and configuration
 
@@ -712,9 +792,23 @@ stamped `routes.updated_at` expressed as epoch millis (the dashboard reads this 
 **Behaviour:**
 1. Verify caller's JWT and resolve to an operator via the `operator_id` claim. Confirm the
    route belongs to that operator (RLS-protected SELECT on `routes`).
-2. Connect to pg_boss via the Supabase Postgres connection (`SUPABASE_DB_URL`).
-3. Call `boss.send('render-route-audio', { route_id, route_version })`.
-4. Return `{ job_id }`.
+2. Connect to pg_boss via the Supabase Postgres connection (`SUPABASE_DB_URL`). Instantiate
+   pg_boss with `{ supervise: false, schedule: false }` per the inviolable rule above.
+3. **Server-side deduplication check (authoritative).** Query pg_boss for any existing job
+   on the `render-route-audio` queue with `state IN ('created', 'active')` whose payload
+   matches `{ route_id, route_version }` exactly. If one exists, return that job's
+   `{ job_id, dedup: true }` without enqueueing a duplicate. The check is a single SQL
+   query against `pgboss.job` filtered by queue name, state, and `data ->> 'route_id'` /
+   `(data ->> 'route_version')::bigint`. This is the **authoritative** dedup for FR-WD-21
+   (the client-side 60-second disable is UX only). Suppressing the duplicate enqueue here
+   prevents the redundant-FCM-dispatch behaviour that round-3 finding 20 named (two clicks
+   would otherwise enqueue two jobs; both pass the staleness check, both find files
+   already present from the first run, both call `boss.complete`, and both dispatch FCM
+   on completion). The per-job staleness check (step 1 of "Per-job processing" below) is
+   still a correctness safety net — it handles the case where dedup is bypassed because
+   the first job has already moved out of `(created, active)` into `completed`.
+4. Call `boss.send('render-route-audio', { route_id, route_version })`.
+5. Return `{ job_id, dedup: false }`.
 
 Direct client-side enqueue is avoided because pg_boss writes require Postgres credentials that
 must not be exposed to the browser. `enqueue-render-job` is deliberately thin — it does not
@@ -722,7 +816,8 @@ read the route data itself; that is the worker's job.
 
 The dashboard also offers a "Re-render audio" action per route (PRD FR-WD-21) which calls
 `enqueue-render-job` with the route's current `updated_at` as `route_version` — useful for
-recovering from terminal failures without modifying route data.
+recovering from terminal failures without modifying route data. The dedup check above is the
+mechanism that makes rapid double-clicks idempotent.
 
 #### Worker: `audio-render-worker` Edge Function
 
@@ -763,7 +858,7 @@ design defers that complexity until it is justified by load.
 5. For each stop, compute the per-stop text `"Next stop: [stop.stop_name]."` and its SHA-256
    hex as that stop's `would_be_content_hash`.
 6. **Differential re-render check (announcement and each stop):**
-   - Define `target_path = {operator_id}/{route_id}/{route_version}/<file>.mp3`.
+   - Define `target_path = {operator_id}/{route_id}/{route_version}/<file>.wav`.
    - If the stored hash on the database row (`routes.audio_announcement_hash` or
      `route_stops.audio_content_hash`) equals the `would_be_*_hash`, the text is unchanged
      since the last successful render. The worker does **not** call Google TTS.
@@ -778,14 +873,19 @@ design defers that complexity until it is justified by load.
 7. **Render path (for any announcement or stop whose hash changed or has no copyable prior):**
    - Call Google Cloud Text-to-Speech `synthesizeSpeech` with:
      - `voice: { languageCode: 'en-GB', name: 'en-GB-Neural2-B' }`
-     - `audioConfig: { audioEncoding: 'MP3', sampleRateHertz: 22050 }`
+     - `audioConfig: { audioEncoding: 'LINEAR16', sampleRateHertz: 24000 }`
+       (24 kHz is the voice's native rate, verified in the round-3 spike — see
+       `spike-records/round-3/findings-tts-frequency.md`; LINEAR16 is required end-to-end
+       to preserve the Reg 13(4)-verified spectrum — see Compliance Mapping Matrix.)
    - **The voice is locked to `en-GB-Neural2-B`.** It is not configurable per operator, per
      route, or per deployment. Changing the voice requires re-running the Reg 13(4)
      frequency verification (Compliance Mapping Matrix) and is therefore a deliberate
      re-planning event, not a runtime knob. This is an inviolable rule alongside the
      alert-chime sequence.
-   - Upload the resulting MP3 bytes to Storage at `target_path` using the service-role
-     Supabase client.
+   - Upload the resulting LINEAR16 PCM bytes wrapped in a canonical PCM WAV container
+     (44-byte header) to Storage at `target_path` using the service-role Supabase client.
+     The Google TTS REST endpoint returns raw LINEAR16 samples; the worker prepends the
+     standard WAV/RIFF header (mono, 24 kHz, 16-bit signed little-endian) before upload.
    - On a successful upload, update the corresponding hash column atomically in a single
      SQL statement:
      - For the announcement: `UPDATE routes SET audio_announcement_hash = $1 WHERE id = $2`.
@@ -847,23 +947,39 @@ A separate scheduled Edge Function `audio-cleanup-worker` runs daily (`cron: '0 
 1. List Storage entries under `{operator_id}/{route_id}/`. Each immediate child folder is a
    `route_version`.
 2. Sort versions descending (largest epoch-millis first).
-3. Keep the **two most-recent** versions. Recursively delete every older version path.
+3. Keep the **three most-recent** versions. Recursively delete every older version path.
 
-**Why two versions, not one.** Two-version retention gives a tablet a recovery window if it
-synced the route metadata just before a new save: the previous version's audio files are
-still available for download, so a tablet that pulled the metadata for version N-1 between
-when N was saved and when N's render completes can still successfully download version N-1's
-audio. One-version retention would risk a 404 in that race window.
+**Why three versions.** Three-version retention gives a tablet a recovery window across the
+common rapid-iteration pattern an operator produces in practice: a "save, notice mistake,
+save again, notice another mistake, save once more" cycle within a single cleanup window
+produces 3 versions. With **two-version** retention (the v3.8 policy) the same scenario
+left a tablet that synced an intermediate version stranded: a tablet that synced version N+1
+at 02:35 — moments before the operator went on to save N+2 at 02:45 and N+3 at 02:55 — would
+find at the 03:00 UTC cleanup that only N+2 and N+3 survived; N+1's Storage path would 404
+until the tablet's next sync. Three versions absorbs the typical iteration depth without
+materially increasing Storage cost (the LINEAR16/WAV audio for one route is ≈ 2.6 MB per
+version — see §2.8; three versions ≈ 8 MB per route, still small relative to other Storage
+usage).
+
+**Named residual assumption.** An operator iterating more than 3 versions of a route
+within a single cleanup cycle (currently 24 hours, 03:00 UTC) may produce transient
+`AUDIO_FILE_MISSING` on tablets that synced an intermediate version. The condition
+**self-heals on the next sync** (the tablet pulls the new `route_version` from metadata
+and downloads from the now-current Storage path; the journey-start gate then opens). The
+03:00 UTC cleanup window is chosen partly because route editing concentrates during the
+working day; running cleanup in a low-activity window minimises the chance of catching a
+mid-iteration tablet. Acceptable behaviour for the initial release; if rapid iteration
+ever becomes routine, the retention count can be lifted or the cleanup cadence relaxed.
 
 The cleanup job is idempotent — running it more than once a day is harmless because each run
 recomputes the keep-set independently. Failure within a day is logged but not retried inside
 the same day; the next day's run picks up the missed work.
 
 **Soft-deleted routes.** When a route is soft-deleted (`routes.is_deleted = true`), the
-two-version retention still applies — both surviving versions remain in place. A future
+three-version retention still applies — all surviving versions remain in place. A future
 cleanup pass may delete all audio versions for soft-deleted routes after a longer retention
 window; the initial release leaves them in place, which is simpler and still bounded by the
-two-version cap.
+three-version cap.
 
 **Manual hard-delete of a route** (a deliberate administrative action; the initial release
 does **not** perform scheduled hard deletes, see §10) removes all versions for that route in
@@ -1045,19 +1161,29 @@ Holds journey-summary rows queued for upload to Supabase `journey_summaries` (§
 
 | Asset | Format | Approximate Size | Description |
 |---|---|---|---|
-| alert_chime.mp3 | MP3 | ~50KB | Alert tone before termination, diversion, and hail-and-ride announcements |
-| silent_keepalive.mp3 | MP3 | ~10KB | Inaudible 1-second audio for Bluetooth speaker keepalive |
-| termination.mp3 | MP3 | ~50KB | Pre-rendered fixed announcement: "This service terminates here. All change, please." |
-| hail_and_ride_start.mp3 | MP3 | ~60KB | Pre-rendered fixed announcement: "You are now entering a hail and ride section. Please signal the driver if you wish to alight." |
-| hail_and_ride_end.mp3 | MP3 | ~50KB | Pre-rendered fixed announcement: "You are now leaving the hail and ride section." |
-| diversion_start.mp3 | MP3 | ~55KB | Pre-rendered fixed announcement: "This service is on diversion. Please check the display for affected stops." |
-| diversion_end.mp3 | MP3 | ~50KB | Pre-rendered fixed announcement: "This service has resumed its normal route." |
+| alert_chime.wav | WAV (LINEAR16 24 kHz mono) | ~100 KB | Alert tone before termination, diversion, and hail-and-ride announcements (~1 second; if shorter, smaller proportionally) |
+| silent_keepalive.wav | WAV (LINEAR16 24 kHz mono) | ~48 KB | Inaudible 1-second audio for Bluetooth speaker keepalive |
+| termination.wav | WAV (LINEAR16 24 kHz mono) | ~300 KB | Pre-rendered fixed announcement: "This service terminates here. All change, please." (~3 s at LINEAR16 mono 24 kHz ≈ 144 KB; a slightly longer rendering plus the WAV header is comfortably under 300 KB) |
+| hail_and_ride_start.wav | WAV (LINEAR16 24 kHz mono) | ~400 KB | Pre-rendered fixed announcement: "You are now entering a hail and ride section. Please signal the driver if you wish to alight." (~6 s) |
+| hail_and_ride_end.wav | WAV (LINEAR16 24 kHz mono) | ~250 KB | Pre-rendered fixed announcement: "You are now leaving the hail and ride section." (~4 s) |
+| diversion_start.wav | WAV (LINEAR16 24 kHz mono) | ~300 KB | Pre-rendered fixed announcement: "This service is on diversion. Please check the display for affected stops." (~5 s) |
+| diversion_end.wav | WAV (LINEAR16 24 kHz mono) | ~250 KB | Pre-rendered fixed announcement: "This service has resumed its normal route." (~4 s) |
 
-The five announcement files are rendered once using the same server-side TTS voice as
-`render-route-audio` (§4.6), ensuring consistent voice quality between fixed and route-specific
-audio. They are updated by shipping a new APK version — not by Supabase Storage sync. Specific
-affected stops are not named in the diversion announcement audio; they are conveyed visually via
-the tube-map display (see Compliance Mapping Matrix Reg 10(1)).
+The five spoken-announcement files are rendered using the same Google Cloud TTS voice
+(`en-GB-Neural2-B`) and the same `audioConfig` (`audioEncoding: 'LINEAR16'`,
+`sampleRateHertz: 24000`) as `audio-render-worker` (§4.6) — ensuring consistent voice quality
+and identical spectral characteristics across fixed and route-specific audio, and preserving
+the Reg 13(4)-verified spectrum end-to-end. They are updated by shipping a new APK version —
+not by Supabase Storage sync. Specific affected stops are not named in the diversion
+announcement audio; they are conveyed visually via the tube-map display (see Compliance Mapping
+Matrix Reg 10(1)).
+
+**Build-time re-rendering.** The committed binaries in `res/raw/` are produced once during
+Stage 2 setup by running the same TTS render path (Google Cloud TTS REST → LINEAR16 → WAV
+container) against the fixed phrases above, then committing the resulting `.wav` files. This
+section specifies the bundled-asset format, content, and size envelope — not the build
+process. Sizes are approximate (LINEAR16 mono 24 kHz is 48 KB/s plus the 44-byte WAV header);
+the actual committed binaries will sit close to these estimates.
 
 ### 6.4 Local Audio File Storage (On-Device)
 
@@ -1072,11 +1198,11 @@ audio/
   {operator_id}/
     {route_id}/
       {route_version}/
-        route_announcement.mp3
-        stop_0.mp3
-        stop_1.mp3
+        route_announcement.wav
+        stop_0.wav
+        stop_1.wav
         ...
-        stop_N.mp3
+        stop_N.wav
 ```
 
 `{route_version}` matches the version segment in the Storage path scheme (§2.8) and is the
@@ -1092,8 +1218,8 @@ checks **both**:
 1. The Room `routes.audio_render_status` for that route is `'ok'`. If it is `pending` or
    `failed`, the gate is closed regardless of file presence.
 2. All expected audio files exist in `filesDir` under the current `{route_version}` directory.
-   Expected files are derived from the route's stop count (one `route_announcement.mp3` +
-   one `stop_{N}.mp3` per stop).
+   Expected files are derived from the route's stop count (one `route_announcement.wav` +
+   one `stop_{N}.wav` per stop).
 
 If either check fails, the route shows an "Audio not ready — syncing" indicator and cannot
 be started. This is a clear error state; there is no fallback to on-device TTS.
@@ -1135,9 +1261,9 @@ Note: the heartbeat (§7.7) is a separate mechanism from route sync. It updates 
 5. Update `sync_metadata.last_server_timestamp` to the `server_now` returned by the RPC.
 6. Update `sync_metadata.last_sync_at` and set `sync_status = 'synced'`.
 7. **Download audio files (version-keyed):** For each route UPSERT'd in step 3 (not deleted), download audio files from Supabase Storage to local file storage (§6.4) using the route's version-keyed path scheme (§2.8):
-   - **audio_enabled guard (first).** Before iterating routes for audio download, read the local device's `audio_enabled` value from the most recently synced `devices` row. **If `audio_enabled = false`, skip the entire audio-download step** — no `route_announcement.mp3` or `stop_{N}.mp3` is downloaded. Display-only tablets do not need route audio and do not waste storage or cellular bandwidth fetching it. Route data and `route_stops` are still downloaded normally (steps 1–6 above); only this audio-download step is skipped.
+   - **audio_enabled guard (first).** Before iterating routes for audio download, read the local device's `audio_enabled` value from the most recently synced `devices` row. **If `audio_enabled = false`, skip the entire audio-download step** — no `route_announcement.wav` or `stop_{N}.wav` is downloaded. Display-only tablets do not need route audio and do not waste storage or cellular bandwidth fetching it. Route data and `route_stops` are still downloaded normally (steps 1–6 above); only this audio-download step is skipped.
    - **Render-status guard.** If the route's `audio_render_status = 'failed'`, do **not** attempt any audio download for it — the version-keyed path will not exist in Storage and the request would 404. Log `AUDIO_FILE_MISSING` once with `detail = 'render_failed'` and move on. The "Audio not ready" indicator (§6.4) continues to gate journey starts. If `audio_render_status = 'pending'`, also defer download — a future sync (after the render worker completes) will see `ok`.
-   - **For routes with `audio_render_status = 'ok'`:** compute `route_version` as the route's `updated_at` in epoch millis. The expected file list is `route_announcement.mp3` plus `stop_{N}.mp3` for each stop, all under `{operator_id}/{route_id}/{route_version}/`.
+   - **For routes with `audio_render_status = 'ok'`:** compute `route_version` as the route's `updated_at` in epoch millis. The expected file list is `route_announcement.wav` plus `stop_{N}.wav` for each stop, all under `{operator_id}/{route_id}/{route_version}/`.
    - If the route was updated in this sync (it appears in the `get_routes_since` response), the path's `route_version` segment has changed; download all audio files for the new version into a fresh local `{route_id}/{route_version}/` directory (see §6.4 layout note). The previous local version directory is removed once the new download completes successfully.
    - If a file is missing locally for the current version, download it.
    - The tablet pulls audio for the specific route version it just synced; older or newer Storage versions are not pulled. If the dashboard saves the route again while the tablet is mid-download, the tablet completes its download of the version it asked for; the next sync round picks up the newer version.
@@ -1375,7 +1501,7 @@ At journey end, the tablet writes a single anonymous-count summary row to local 
        |                   |-- (No STOP_ANNOUNCED — H&R stops are traversed silently)
        |                   |-- Update journey_state.current_stop_index → N+1
        |                   |--------- Emit StateFlow update ---------->|
-       |                   |                       |-- Play alert_chime.mp3 then hail_and_ride_start.mp3
+       |                   |                       |-- Play alert_chime.wav then hail_and_ride_start.wav
        |                   |                       |-- Update tube-map: H&R section rendered dashed
        |                   |
        |   [Stop N has segment_type='scheduled' AND preceding stop was 'hail_and_ride']
@@ -1384,8 +1510,8 @@ At journey end, the tablet writes a single anonymous-count summary row to local 
        |                   |-- INSERT journey_event (STOP_ANNOUNCED, stop N, trigger=GPS)
        |                   |-- Update journey_state.current_stop_index → N+1
        |                   |--------- Emit StateFlow update ---------->|
-       |                   |                       |-- Play alert_chime.mp3 then hail_and_ride_end.mp3
-       |                   |                       |-- Play stop_{N}.mp3
+       |                   |                       |-- Play alert_chime.wav then hail_and_ride_end.wav
+       |                   |                       |-- Play stop_{N}.wav
        |                   |                       |-- Update tube-map: H&R section complete
        |                   |
        |   [current_stop_index N is present in journey_skipped_stops]
@@ -1422,7 +1548,7 @@ At journey end, the tablet writes a single anonymous-count summary row to local 
        |                  |<-- Storage server-side copy from prev version ------------|               |
        |                  |                                  hash differs or no prior version →
        |                  |                              Google TTS synthesize (en-GB-Neural2-B) ----> Google Cloud
-       |                  |<-- Storage PUT at {operator_id}/{route_id}/{route_version}/...mp3 --------|
+       |                  |<-- Storage PUT at {operator_id}/{route_id}/{route_version}/...wav --------|
        |                  |    UPDATE route_stops.audio_content_hash                  |               |
        |                  |    UPDATE routes.audio_announcement_hash                  |               |
        |                  |                  |                                                        |
@@ -1438,8 +1564,8 @@ At journey end, the tablet writes a single anonymous-count summary row to local 
        |                                                                                             |-- Replace route_stops
        |                                                                                             |-- Update last_server_timestamp
        |                  |                                                                          |
-       |                  |<-- Storage GET {operator_id}/{route_id}/{route_version}/*.mp3 -----------|
-       |                  |--- Stream MP3 files -------------------------------------------------->  |
+       |                  |<-- Storage GET {operator_id}/{route_id}/{route_version}/*.wav -----------|
+       |                  |--- Stream WAV files (LINEAR16 PCM) ----------------------------------->  |
        |                                                                                             |-- Store in filesDir/audio/{operator_id}/{route_id}/{route_version}/
 
     Failure branch (terminal, after pg_boss retries exhausted):
@@ -1525,7 +1651,7 @@ At journey end, the tablet writes a single anonymous-count summary row to local 
 | Journey state (local) | Cleared on journey end **or on stale-recovery auto-clear (PRD FR-AT-18)** | `is_active = false` when journey completes; pending_deletion cleanup runs here too. On app launch, journey state older than 8 hours or with no `journey_events` activity in the last hour is auto-cleared (see §5.5 staleness rules; logs `JOURNEY_AUTO_CLEARED`). |
 | Active vs auto-deregistered devices | **30 days heartbeat-billable; 60 days auto-deregister** | A scheduled daily job (sharing the 03:00 UTC cleanup window) sets `devices.activation_state = 'inactive'` for any device whose `last_seen_at` is older than `now() - interval '60 days'`. Billing reports exclude any device whose `last_seen_at` is older than `now() - interval '30 days'`, regardless of `activation_state`. **`last_seen_at` is the source of truth** — maintained by the heartbeat mechanism (§7.7 / PRD FR-AT-64) rather than by route sync alone. The 30-day grace gives operators a buffer for seasonal or in-repair tablets; the 60-day cutoff bounds the lifetime of dormant rows. This pairing reconciles PRD §1.4 (billing) with this retention policy; previously these numbers were "operations decisions" and uncoordinated. |
 | Anonymous Supabase Auth users | Indefinite (known unbounded growth) | Every pair-device creates a new anonymous `auth.users` row; device deactivation flips `devices.activation_state = 'inactive'` but does not remove the auth user. MVP-acceptable at projected fleet size; a future cleanup task (delete `auth.users` rows for `inactive` devices with no activity in the last 12 months) is recorded as out-of-scope but acknowledged — see §3.2 paragraph. |
-| Route audio (Storage) | Two most-recent versions per route | Daily `audio-cleanup-worker` (§4.7) at 03:00 UTC; older `{route_version}` paths removed |
+| Route audio (Storage) | Three most-recent versions per route | Daily `audio-cleanup-worker` (§4.7) at 03:00 UTC; older `{route_version}` paths removed. (Increased from two in v3.9 — see §4.7 rationale and the named rapid-iteration assumption.) |
 | pg_boss jobs | 7 days after completion or terminal failure | `retentionDays: 7` on the `render-route-audio` queue (§4.6); pg_boss archives to `pgboss.archive` then prunes |
 | Journey summaries (Supabase) | Indefinite | Operator-visible in the dashboard per-device drill-down (PRD FR-WD-23). No automatic deletion; the system administrator may prune via service role if storage cost ever becomes a concern. No PII to protect. |
 | Journey summaries pending (local) | Until successful upload | Deleted from `journey_summaries_pending` (§5.8) on a successful INSERT into Supabase `journey_summaries`. Rows survive app restarts; the upload step retries on every sync. |
@@ -1559,7 +1685,7 @@ TTS. On-device TTS is not used anywhere in this product.
 
 **Differential re-rendering via content hashes.** Each route's `routes.audio_announcement_hash`
 and each stop's `route_stops.audio_content_hash` capture the SHA-256 of the text most recently
-rendered to the corresponding MP3 file. On re-render, the audio render worker (§4.6) computes
+rendered to the corresponding WAV file. On re-render, the audio render worker (§4.6) computes
 the would-be hashes for the current text, compares against the stored hashes, and only
 renders stops whose hash has changed. Unchanged audio is server-side-copied from the previous
 version's Storage path into the new version's path, so a direction-label-only edit (which
@@ -1567,7 +1693,7 @@ changes no announcement text) calls Google TTS zero times.
 
 **Version-keyed Storage paths.** Each route save produces a new `{route_version}` path prefix
 (`routes.updated_at` in epoch millis). Tablets pull audio for the exact route version they
-synced; older versions remain in Storage for a recovery window of two versions (cleanup
+synced; older versions remain in Storage for a recovery window of three versions (cleanup
 policy in §4.7). This makes concurrent saves race-safe by construction — two saves cannot
 collide on the same path.
 
@@ -1635,6 +1761,17 @@ are dropped silently rather than blocking the request path.
 one-off operational task performed at Stage 2/3 start (when the Android app and dashboard
 exist). It is not a per-deployment or per-release task. See the §12 setup checklist.
 
+**Google Cloud Text-to-Speech (output format note, v3.9).** Although the primary Google
+Cloud TTS contract is described in §4.6 and PRD §11.2, two output-format details bear
+mention here because they affect Storage, Sync, and Reg 13(4) compliance: (1) the TTS API
+call must request `audioEncoding: 'LINEAR16'` and `sampleRateHertz: 24000` (the voice's
+native rate); (2) the rendered output is stored as a canonical PCM WAV file (`.wav`) — the
+worker prepends a 44-byte WAV header to the raw LINEAR16 bytes returned by the API. MP3 is
+**not** used anywhere in the pipeline. This is part of the Reg 13(4) compliance argument:
+no lossy compression sits between the verified-spectrum renderer and the tablet's speaker
+(Compliance Mapping Matrix Reg 13(4); spike record at
+`spike-records/round-3/findings-tts-frequency.md`).
+
 ---
 
 ## 12. Environment Variables and Secrets
@@ -1677,13 +1814,23 @@ deployment):
    empty result set for valid-looking JWTs because the policies' `(auth.jwt()->>'operator_id')`
    resolves to NULL. This is by far the most common cause of an apparently-broken-but-not-erroring
    fresh deployment.
-5. Schedule `audio-render-worker` (`* * * * *`) and `audio-cleanup-worker` (`0 3 * * *`) via
-   Supabase's scheduled functions. Add the daily `rate_limit_attempts` cleanup (§2.9) and the
-   daily 60-day device auto-deregistration (§10) to the existing 03:00 UTC scheduled
-   function rather than creating new schedules.
-6. Complete the Reg 13(4) voice-frequency verification described in the Compliance Mapping
-   Matrix and record the result in the operations runbook before serving any production
-   traffic.
+5. Schedule `audio-render-worker` (`* * * * *`), `audio-cleanup-worker` (`0 3 * * *`),
+   and **`pgboss-maintain` (`0 * * * *`)** via Supabase's scheduled functions. Add the
+   daily `rate_limit_attempts` cleanup (§2.9) and the daily 60-day device
+   auto-deregistration (§10) to the existing 03:00 UTC scheduled function rather than
+   creating new schedules. The `pgboss-maintain` function runs `boss.maintain()` hourly
+   and is a hard requirement when `audio-render-worker` is constructed with
+   `{ supervise: false, schedule: false }` (the inviolable rule in §4.6) — without
+   `pgboss-maintain`, pg_boss's internal archive/expiry/dead-job-recovery duties never
+   run, and over time crashed jobs would remain stuck in `active`.
+6. Reg 13(4) voice-frequency verification is **already complete** — see
+   `spike-records/round-3/findings-tts-frequency.md` (empirical spectral analysis of
+   `en-GB-Neural2-B` at LINEAR16 / 24 kHz; 66.67 % energy survives a 300 Hz hi-pass,
+   formant-zone share 41.79 %, smoothed upper audible cutoff 3 451 Hz) and Compliance
+   Mapping Matrix Reg 13(4). No additional pre-deployment voice verification work
+   remains. If at any future point the locked voice is changed from `en-GB-Neural2-B`,
+   the verification must be re-run against the new voice (this is itself a Case 1
+   re-planning event per WORKFLOW.md).
 7. Create three Sentry projects (Android, Dashboard, Edge Functions) and provision their
    DSNs (§11.2). Store `SENTRY_DSN_EDGE` as a Supabase secret; configure
    `SENTRY_DSN_DASHBOARD` in Vercel; inject `SENTRY_DSN_ANDROID` into the Android build
