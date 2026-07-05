@@ -3,7 +3,7 @@
 
 **This is the living snapshot of the project. It is the current authority for what is built, what remains, and what is being worked on. It is overwritten at the end of each working session to always reflect reality.** Session-by-session history is append-only in `pds-planning/sessions/`. The narrative history up to the July 2026 workflow migration is in `pds-planning/historical/PROJECT-HISTORY.md`. The original planning documents (frozen, historical) are alongside it in `pds-planning/historical/`.
 
-**Last updated:** July 2026 (workflow-migration snapshot — first STATE.md).
+**Last updated:** July 2026 (post CLAUDE.md-rewrite session, 2026-07-05).
 
 ---
 
@@ -23,17 +23,13 @@ The product is **functionally near-complete on both surfaces.** Everything below
 
 **Android (`pds-android`) — feature-complete bar one slice.** Pairing and encrypted credential storage; reactive JWT recovery and lifecycle heartbeat; the full sync engine (route/stop/audio download, three triggers, hands-free dashboard→tablet propagation); GPS stop detection; all automatic announcements (route, next-stop, termination, hail-and-ride) with the alert chime, co-equal screen flash, and text overlay; screen calibration and physically-measured ≥22mm text; the tube-map progress view; journey completion/termination; hail-and-ride sections; diversions (author/observe, GPS auto-skip, replay-on-resume); Level 1 kiosk (screen pinning + default launcher); admin PIN and the full admin menu; and post-journey summary upload.
 
-**Current `main`:** `pds-android` is at the local-hygiene commit (`835efd8`); the FR-AT-66 journey-summary-upload commit is its parent (`0df4ba1`). `pds-dashboard` is at Stage-1-complete + migrations through 024, deployed to production.
+**Current `main`:** `pds-android` is at `2489345` (frozen-docs removal; before it `7254e78` CLAUDE.md rewrite, then the `835efd8` local-hygiene commit). `pds-dashboard` is at `d0a0cbd` — Stage-1-complete + migrations through 024, deployed to production. Both repo `CLAUDE.md` files are lean and code-grounded (last verified against code July 2026); the frozen v3.9 planning docs are single-homed in `pds-planning/historical/` (refreshed from stale v3.7 in `2af75c4`); the repo `docs/` folders and the dashboard's Next-generated `AGENTS.md` are deleted.
 
 ---
 
 ## What's Left To Do
 
-In order. Items 1–5 are the pre-pilot set; item 6 follows.
-
-### 1. Rewrite both repo CLAUDE.md files (lean, code-grounded)
-
-The two repository `CLAUDE.md` files have accumulated changelog cruft and spec-form rules superseded by built conventions. Rewrite each **against the actual code** — keep the canonical `[Tag] Rule` lists and the known-gotchas, drop the archaeology and version-changelog bloat. Android's file carries the compliance-load-bearing rules (≥22mm text, asymmetric announcement locking, co-equal visual, event-vs-approached index discipline); dashboard's carries the Next.js/Supabase/Edge-Function conventions and deploy gotchas. Keep them **separate** — the two repos have genuinely different rules and merging them dilutes precision. This is the natural first act in the new workspace.
+In order. Items 2–5 are the pre-pilot set; item 6 follows. (Item 1 — the repo CLAUDE.md rewrite — completed 2026-07-05; numbering is kept stable because the repo CLAUDE.md files cite items 3 and 4 by number.)
 
 ### 2. Driver-controls / audio-output slice — 3 commits
 
@@ -73,7 +69,7 @@ Firebase staging/production project split (currently a single shared Firebase pr
 - `devices.active_route_id` sync stage is a reserved no-op — server-alignment domain, deferred.
 - Stationary-detection timeout is hardcoded (could be admin-configurable).
 - The Sentry PII-scrubber is a stub (`SentryPiiScrubber`) — real scrubbing logic pending (relevant when Edge Function Sentry lands, item 3).
-- Two stale-but-harmless dashboard strings (a "route builder coming in the next release" empty-state that's wrong — the builder exists; a misleading comment on the re-render action). Cosmetic; sweep up opportunistically.
+- Four known-stale dashboard text sites, catalogued in the dashboard CLAUDE.md's "known-stale text" gotcha: the "route builder coming in the next release" empty-state (`routes/page.tsx:59` — the builder exists); the misleading `triggerReRender` comment (`lib/actions/routes.ts:372–376` — calls the real enqueue path a "stub"); the `src/proxy.ts:~10` comment claiming gating lives in the dashboard layout (it lives in the middleware — Rule 3); and the `pair-device/index.ts:177` "deferred unique index" comment (repo-side stale — migration 024 landed the index; whether the *deployed* function matches is item 4's question). Cosmetic; sweep up opportunistically.
 
 ---
 
@@ -101,6 +97,9 @@ These are the decisions that currently shape how work is done on this codebase. 
 13. **Bluetooth disconnect** uses `AudioDeviceCallback` in a singleton shaped like the GPS-signal monitor, registered for the journey's lifetime, with `NEVER_CONNECTED` / `CONNECTED` / `DISCONNECTED` states — only `DISCONNECTED` warns. The warning reuses the two-surface amber-marker pipe (status strip + panel-header re-surface); two simultaneous markers stack vertically.
 14. **Keep-alive** plays on a `LocationService` coroutine ticker (not WorkManager — its 15-min floor can't do a 10-min tick), via a **separate silent playback path that never touches the announcement mutex** (so it can never drop or be dropped by a real announcement), skipping the volume-floor and AudioFocus; gated on `audio_enabled`; keeps playing under Emergency Mute (mute is about audible output); runs unconditionally rather than gating on Bluetooth state.
 15. **Manual H&R fallback** introduces an **in-memory** `manualHailRideActive` state (not persisted — its correct lifetime is "until the driver ends it or GPS recovers," and the compliance-safe failure direction on a crash is *toward* re-enabling normal announcements) that the next-stop-suppression check ORs with `segment_type` at both call sites. Manual state is authoritative while active: a GPS-derived section start/end is a no-op while it's on. The manual use case flips the state and logs the event even if the announcement itself is drop-overlapped (the state change is the load-bearing effect); the button shows brief press confirmation. Wired through the view-model via dedicated use cases, never the composable touching the announcement bus directly.
+
+**Documentation discipline (added 2026-07-05):**
+16. **Repo CLAUDE.md rule numbers are frozen.** Code comments in both repos cite the architectural rules by number ("Rule N"), so rule numbers are never reused, reordered, or repurposed — a retired rule's number stays retired, and new rules append at the end of the list. New feature areas are documented as conventions unless they carry a genuinely new inviolable constraint.
 
 ---
 
