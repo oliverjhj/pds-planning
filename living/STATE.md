@@ -3,7 +3,7 @@
 
 **This is the living snapshot of the project. It is the current authority for what is built, what remains, and what is being worked on. It is overwritten at the end of each working session to always reflect reality.** Session-by-session history is append-only in `pds-planning/sessions/`. The narrative history up to the July 2026 workflow migration is in `pds-planning/historical/PROJECT-HISTORY.md`. The original planning documents (frozen, historical) are alongside it in `pds-planning/historical/`.
 
-**Last updated:** July 2026 (post CLAUDE.md-rewrite session, 2026-07-05).
+**Last updated:** July 2026 (post driver-controls/audio-output-slice session, 2026-07-08).
 
 ---
 
@@ -21,23 +21,15 @@ The product is **functionally near-complete on both surfaces.** Everything below
 
 **Backend (Supabase).** Two projects in lockstep (staging + production). Operator-scoped RLS, the pairing/recovery/pairing-code Edge Functions, the pg_boss render pipeline, Storage for route audio, NaPTAN full-text search, and the `journey_summaries` table. Migrations are believed to be in lockstep on both environments through the latest (a one-shot production audit is queued below to confirm).
 
-**Android (`pds-android`) — feature-complete bar one slice.** Pairing and encrypted credential storage; reactive JWT recovery and lifecycle heartbeat; the full sync engine (route/stop/audio download, three triggers, hands-free dashboard→tablet propagation); GPS stop detection; all automatic announcements (route, next-stop, termination, hail-and-ride) with the alert chime, co-equal screen flash, and text overlay; screen calibration and physically-measured ≥22mm text; the tube-map progress view; journey completion/termination; hail-and-ride sections; diversions (author/observe, GPS auto-skip, replay-on-resume); Level 1 kiosk (screen pinning + default launcher); admin PIN and the full admin menu; and post-journey summary upload.
+**Android (`pds-android`) — feature-complete.** Pairing and encrypted credential storage; reactive JWT recovery and lifecycle heartbeat; the full sync engine (route/stop/audio download, three triggers, hands-free dashboard→tablet propagation); GPS stop detection; all automatic announcements (route, next-stop, termination, hail-and-ride) with the alert chime, co-equal screen flash, and text overlay; screen calibration and physically-measured ≥22mm text; the tube-map progress view; journey completion/termination; hail-and-ride sections; diversions (author/observe, GPS auto-skip, replay-on-resume); Level 1 kiosk (screen pinning + default launcher); admin PIN and the full admin menu; and post-journey summary upload. The driver-controls/audio-output slice landed 2026-07-08: per-announcement AudioFocus, external-speaker disconnect monitoring (two-surface amber warning + driver dismiss, FR-AT-63 device events), the silent Bluetooth keep-alive, the driver volume slider + app-wide hardware volume-key clamp against the PIN-owned floor, Emergency Mute (audio-only, third amber marker), and the manual hail-and-ride fallback buttons (unit-verified; glass folded into item 5).
 
-**Current `main`:** `pds-android` is at `2489345` (frozen-docs removal; before it `7254e78` CLAUDE.md rewrite, then the `835efd8` local-hygiene commit). `pds-dashboard` is at `d0a0cbd` — Stage-1-complete + migrations through 024, deployed to production. Both repo `CLAUDE.md` files are lean and code-grounded (last verified against code July 2026); the frozen v3.9 planning docs are single-homed in `pds-planning/historical/` (refreshed from stale v3.7 in `2af75c4`); the repo `docs/` folders and the dashboard's Next-generated `AGENTS.md` are deleted.
+**Current `main`:** `pds-android` is at `1585a47` — the driver-controls/audio-output slice (`f653d17` audio hardening, `a5dfc79` diagnostic strip, `f8d91fb` volume + Emergency Mute, `f1490eb` diagnostic strip, `1585a47` manual H&R fallback; before them `2489345` frozen-docs removal). `pds-dashboard` is at `d0a0cbd` — Stage-1-complete + migrations through 024, deployed to production. Both repo `CLAUDE.md` files are lean and code-grounded (last verified against code July 2026); the frozen v3.9 planning docs are single-homed in `pds-planning/historical/` (refreshed from stale v3.7 in `2af75c4`); the repo `docs/` folders and the dashboard's Next-generated `AGENTS.md` are deleted.
 
 ---
 
 ## What's Left To Do
 
-In order. Items 2–5 are the pre-pilot set; item 6 follows. (Item 1 — the repo CLAUDE.md rewrite — completed 2026-07-05; numbering is kept stable because the repo CLAUDE.md files cite items 3 and 4 by number.)
-
-### 2. Driver-controls / audio-output slice — 3 commits
-
-The one remaining feature slice. Confirmed unbuilt by code recon; the pilot's **Bluetooth-likely audio** and **hail-and-ride routes** make it compliance-relevant, not polish. All design forks are **already decided** — see the Decision Ledger below; the build should not re-litigate them. Build order (grouped by risk, lowest first; each commit compiles clean):
-
-- **Commit 1 — audio-output hardening (FR-AT-29/30/31).** AudioFocus (`GAIN_TRANSIENT_MAY_DUCK`, per-announcement, play-on-denial for regulated audio); Bluetooth-disconnect handling (auto-fallback to built-in speaker + persistent driver warning mirroring the amber GPS-loss marker); and the keep-alive (the bundled `silent_keepalive.wav`, currently unreferenced dead weight, played every ~10 min during a journey). All additive; touches no schema and no detection core.
-- **Commit 2 — volume + Emergency Mute (FR-AT-44).** Driver-panel volume slider bound to live stream volume clamped ≥ floor; hardware volume-button interception; and the Emergency Mute toggle hoisted into the always-visible panel header. Logs mute engage/release to `journey_events`. No schema bump (mute is in-memory — see ledger).
-- **Commit 3 — manual hail-and-ride fallback (FR-AT-26/41) — lands last and alone.** A driver-panel control to manually fire H&R section start/end when GPS misdetects. This is the only part that touches the **verified detection core** (it introduces a runtime "manual H&R active" state the next-stop-suppression check must consult), so it is isolated to its own commit with dedicated interpreter unit tests and the full-app GPS glass pass, exactly as the diversion auto-skip slice was isolated.
+In order. Items 3–5 are the pre-pilot set; item 6 follows. (Item 1 — the repo CLAUDE.md rewrite — completed 2026-07-05. Item 2 — the driver-controls/audio-output slice — completed 2026-07-08 as the three planned commits, `f653d17`…`1585a47`: commits 1–2 glass-verified on the tablet; commit 3 unit-green with its glass cases folded into item 5. Numbering is kept stable because the repo CLAUDE.md files cite items 3 and 4 by number.)
 
 ### 3. Edge Function Sentry
 
@@ -49,7 +41,7 @@ Confirm the deployed production state matches what the record claims: that migra
 
 ### 5. Full-app GPS glass pass (verification, not building)
 
-One consolidated hardware run on the Lenovo tablet driving route `575261eb` ("Marford to Guildhall") with Lockito: verify the four deferred diversion-skip cases (plain mid-route skip, H&R-silent landing, manual-override, empty-set — all unit-green, not yet glass-verified), the new manual-H&R fallback from commit 3, and an eyeball of the tube-map hail-and-ride rendering (diamonds + dashed run).
+One consolidated hardware run on the Lenovo tablet driving route `575261eb` ("Marford to Guildhall") with Lockito: verify the four deferred diversion-skip cases (plain mid-route skip, H&R-silent landing, manual-override, empty-set — all unit-green, not yet glass-verified); the manual-H&R fallback (built 2026-07-08, unit-green): manual start suppresses next-stop + segment-derived boundaries, always-fire non-transition end press announces + logs, drop-overlap press shows the on-button confirmation, `DRIVER_HAIL_RIDE` event rows land, and the second "leaving" announcement after a manual END inside a physical H&R region is *expected* (documented in `TriggerManualHailRideUseCase`); and an eyeball of the tube-map hail-and-ride rendering (diamonds + dashed run).
 
 ### 6. Then: Stage 4 + pilot
 
@@ -89,7 +81,7 @@ These are the decisions that currently shape how work is done on this codebase. 
 7. **One-prompt-one-commit; commit via message-file** (not a here-string — avoids stray `@`). Compliance features are glass-verified on the real Lenovo tablet before commit.
 8. **Docs are evidence, not authority** — the frozen planning docs record what was designed/built; current implementation + judgment are authoritative where they differ. Divergence is expected.
 
-**Decided design for the driver-controls / audio-output slice (do not re-litigate):**
+**As-built design record for the driver-controls / audio-output slice (built 2026-07-08; #9–15 were the pre-build decisions, all honoured — see also #17–19 for the plan-review refinements):**
 9. **Whole slice stays schema-free.** No Room migration. Emergency Mute state is an **in-memory journey-scoped singleton** (evaporates on process death — accepted; avoids a schema bump during the workflow migration); it still logs `MUTE_ENGAGED`/`MUTE_RELEASED` to `journey_events` (additive, no migration).
 10. **Volume slider** binds to the live accessibility stream, clamped to `floor..100%` via a shared clamp helper; **hardware volume keys** use an explicit key override (not `volumeControlStream`) routed through the same clamp, so the floor is honest at key-time. The admin-menu volume-floor setting stays the PIN-owned authority; the driver slider moves live volume within it.
 11. **Emergency Mute** gates inside the announcement player *only* (alongside the existing `audio_enabled` early-return, before the volume-floor raise) — this is architecturally identical to `audio_enabled = false`, which already proves the visual path is untouched (ledger #1). Never gate mute upstream at the announcement coordinator.
@@ -100,6 +92,11 @@ These are the decisions that currently shape how work is done on this codebase. 
 
 **Documentation discipline (added 2026-07-05):**
 16. **Repo CLAUDE.md rule numbers are frozen.** Code comments in both repos cite the architectural rules by number ("Rule N"), so rule numbers are never reused, reordered, or repurposed — a retired rule's number stays retired, and new rules append at the end of the list. New feature areas are documented as conventions unless they carry a genuinely new inviolable constraint.
+
+**Plan-review refinements from the slice build (added 2026-07-08; each owner-approved in plan review):**
+17. **Manual H&R buttons are always-fire** (PRD FR-AT-41 verbatim, chosen over a strict transition-only toggle): every press logs the section event, fires the chimed announcement "regardless of segment boundaries", and idempotently sets/clears the manual override — a non-transition press still announces, giving one-tap recovery when GPS auto-fired a section start but missed the end. A repeated announcement from a re-press is deliberate correction behaviour, **not a bug to fix**.
+18. **Focus-denial asymmetry:** a non-regulated announcement (next-stop / route-and-destination) **drops** on an AudioFocus denial (breadcrumbed); only regulated audio plays regardless (#12). The keep-alive requests no focus at all (#14).
+19. **The speaker-disconnect warning is driver-dismissible** (PRD FR-AT-30 verbatim, chosen over the plain GPS-marker mirror) — a per-episode `DISMISSED` machine state, with the dismiss affordance in the panel header only; and an engaged Emergency Mute shows a third amber "Audio muted" strip marker, so a silently-muted tablet is never visually normal.
 
 ---
 
