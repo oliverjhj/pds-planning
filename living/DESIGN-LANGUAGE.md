@@ -37,9 +37,10 @@ The identity: an Edwardian railway booking hall. Gelasio serif, ticket-stock das
 
 - **ticket-edge** — 1.5px dashed border; tables, cards, panels, ghost buttons. Dashboard utility class `ticket-edge`.
 - **stamp** — status badges: 3px double border, −3° rotation, letterspaced caps. Dashboard utility class `stamp`. **Dashboard/driver-side only.**
-- **Serial Nº** — decorative mono "Nº ####" in ephemera red, digits derived from the entity UUID (`SerialNo` component on the dashboard). Detail-page headers.
-- **Wordmark** — "PDS" bold caps, `.14em` tracking.
-- **Mode toggle** — the half-light/half-dark circle (inline SVG on web, Canvas `drawArc` on Android). Dashboard header (cookie `pds-theme`, read server-side — never a pre-hydration script) and driver panel (`DisplayThemeStore`, default dark).
+- **Serial Nº** — decorative mono "Nº ####" in ephemera red. Dashboard: digits derived from the entity UUID (`SerialNo` component), detail-page headers. Tablet: the route's operator-assigned number on the journey banner. On Android the red is the `ephemera` `PassengerPalette` role (both palettes, `PassengerPaletteTest`-guarded: ≥3:1 on the ground, hue outside the amber band).
+- **Wordmark** — "PDS" bold caps, `.14em` tracking. **Dashboard only** — the tablet's banner shows the operator's company name in mixed case instead (Reg 14(5)(a)).
+- **Journey banner band** (tablet, 2026-07-11) — a 56dp header strip on the passenger display: operator company name left (Gelasio, mixed case), route-number Nº right (ephemera mono), dashed ticket-edge bottom border (ink @ ~30%). It hosts the top-end control cluster and is what lets the regulated ticker lines below run full width; dropped at the smallest layout tier.
+- **Mode toggle** — the half-light/half-dark circle (inline SVG on web, Canvas `drawArc` on Android). Dashboard header (cookie `pds-theme`, read server-side — never a pre-hydration script) and, since 2026-07-11, the tablet's **app-wide top-end control cluster** beside the admin gear (`presentation/common/ThemeToggleButton`; `DisplayThemeStore`, default dark) — no longer in the driver-panel header. Cluster chips draw from the Material scheme (surfaceContainerHigh disc, outlineVariant ring, primary glyphs) — never raw black/white.
 - Radius stays small (0.25rem web / 2–4dp feel) — ticket stock, not bubbles.
 
 ## Compliance constraints the design must never break (tablet passenger surface)

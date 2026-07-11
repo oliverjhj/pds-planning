@@ -1,0 +1,42 @@
+# Session: 2026-07-11 — Minimum-text tickers, responsive tiers, banner, and control relocations
+
+**What changed:** The "settle minimum-text sizing once and for all" slice, plus a set of owner-requested control relocations — 12 pds-android commits across four owner feedback rounds (discussion → plan-mode plan → build → three glass-driven iteration rounds).
+
+1. **Horizontal ticker engine (Rule 13 extension).** The three legally-required persistent items — route name (Reg 7(1)(a)), final destination (Reg 7(1)(b)), next stop (Reg 9(1)) — are now single-line tickers at the ≥22 mm floor: static and centred when they fit, an infinite `basicMarquee` at a physical speed (`TICKER_SPEED_MM_PER_SEC = 18` mm/s, calibration-independent like the teleprompter, deliberately a SEPARATE constant from the overlay's verified one) when they overflow. Never wrapped, never truncated, never below the floor — any content length fits any screen width. The hero's grow-line-count fallback is superseded (single-line ladder → 22 mm ticker). Pure `tickerPlan` maths + `PassengerTickerLine` composable; the regulated overlay keeps its vertical teleprompter (owner-agreed — sentences read better wrapped).
+2. **Compliance gap surfaced and fixed.** The final destination had NO ≥22 mm visual carrier (only the 5 mm direction tag; the Compliance Matrix claims it is displayed). The route line now reads "[Route Name] — to [Final Stop]" — always appended (compliance-safe direction).
+3. **Responsive tier system.** `PassengerTierMath.resolveLayoutPlan` (pure, unit-tested) degrades LAYOUT only from measured pixel budgets — the plan has no font-size output by design, so the 22 mm floor is invariant down to a hypothetical phone. Monotone levers: Tier A (full stack) → tube band 110→72 dp → caption dropped (label inlined "Next stop: X") → Tier C: one combined 22 mm ticker, tube map dropped, compact 48 dp status bar (amber markers never dropped). **Tier C's ticker is the sole Reg 10(1) carrier** — during a diversion it appends "Not stopping at: [names]" because the tube map that normally carries the strikethroughs is gone. Resolved from ROOT constraints only (feedback-loop guard).
+4. **Booking Hall journey banner** (owner round 2): 56 dp header band — operator company name left, route-number Nº right in the new `ephemera` palette role (both palettes; `PassengerPaletteTest` guards ≥3:1 contrast AND hue outside the amber band so it can never be mistaken for the semantic warning), dashed ticket-edge bottom border. The band hosts the control cluster, which is what lets both regulated tickers run FULL width (the route line's 112 dp cluster clearance was round-1 feedback). The operator name reaches the tablet via the stage-2 gate read now also selecting `operators.company_name` (deployed-shape audited on staging: column + `authenticated` SELECT grant confirmed; prod in ledger-verified migration lockstep) and mirroring it best-effort into `DeviceIdentityStore.operatorName` — null since pairing because pair-device omits it; self-populates on first sync, tracks renames, never affects the gate.
+5. **Manual sync relocated.** The PIN-gated admin-menu "Force sync" (and `ForceSyncUseCase`/`ForceSyncResult`) is deleted; manual sync is now a ⟳ IconButton directly beside the "Synced · HH:mm" label on the route-list strip — `TriggerManualSyncUseCase`, fire-and-forget `syncTriggers.fire("manual_refresh")`, the strip's Room-reactive SYNCING label is the feedback. (Round-3 fix: the icon was initially spacer-pushed to the far screen edge — easy to miss; now adjacent.)
+6. **Top-end control cluster.** The admin gear moved from its deliberately-faint top-LEFT handle to an app-wide top-END cluster beside the theme toggle, which moved OUT of the driver-panel header (`ThemeToggleButton` → `presentation/common`; reachable from route list AND journey now). Full-opacity, scheme-drawn chips (surfaceContainerHigh disc, outlineVariant ring, primary glyphs — round-4 fix from raw black/white). Hide-during-regulated behaviour unchanged. Tube-map edge labels clamp to a 16 dp inset (aligned with the direction tag); the route-list app bar dropped a double-counted status-bar inset so "Routes" sits inline with the cluster.
+
+**Commits (all pds-android, all owner-reviewed and pushed):**
+- `39cb2e0` — feat: horizontal passenger ticker engine (pure math + shared composable)
+- `65b1245` — feat: route line carries the final destination (Reg 7(1)(b)); hero single-line + ticker fallback
+- `6c4d106` — feat: responsive passenger layout tiers — computed fit, 22 mm floor at every tier
+- `4c03532` — feat: relocate manual sync from admin menu to the route-list status strip (FR-AT-09)
+- `9071712` — feat: top-right control cluster — theme toggle + admin gear (Rule 20 / FR-AT-48)
+- `168a4d2` — docs: CLAUDE.md ticker/tier built implementation, cluster toggle, manual-sync convention
+- `5ca3371` — fix: tube-map edge labels clamp to a 16 dp inset, aligned with the direction tag
+- `9484b29` — feat: Booking Hall banner band; regulated tickers run full width below it
+- `936c3eb` — fix: sync refresh icon sits directly beside the last-synced label
+- `4308569` — feat: banner shows the operator's company name and the route's assigned number
+- `2b6b047` — fix: control-cluster chips use Booking Hall scheme colours, not raw black/white
+- `58203f5` — fix: route-list app bar drops its double-counted status-bar inset
+
+**Decisions made:**
+- **Horizontal marquee is the answer to the minimum-text problem** for the persistent identity lines (train/bus PIS idiom; the only approach that scales to arbitrary length at a fixed ≥22 mm), with **static-when-fits** as the load-bearing refinement — fully-visible text is the most conservative reading of "displayed"; motion is strictly the overflow fallback. The overlay stays a teleprompter; unification is at the engine level, not the visual level. (Ledger #26.)
+- **Tier degradation is layout-only, computed-fit, monotone**; the Tier-C combined ticker knowingly softens the "route name continuously visible" posture (shared line, industry-standard on LED flag displays) — owner-accepted; phones remain non-deployable under Reg 14(2) sightline duties anyway.
+- **Manual sync is deliberately no longer PIN-gated** — idempotent, single-flight, drop-not-queue makes a passenger-reachable ⟳ harmless.
+- The pop-up cancel-X idea was **dropped** after the compliance discussion (a dismiss on the regulated overlay is a kill switch for legally-required information; collapse-on-fire stays inviolate).
+- The old "deliberately faint admin handle" posture is superseded: the cluster is an obvious control by owner decision.
+
+**Verified:** `assembleDebug` + full unit suite green per commit (37 unit tests at close: ticker plan, tier boundaries/monotonicity/calibration-independence, ephemera contrast+hue, plus the existing suites). Grep gates clean every commit (no uppercase transforms on passenger surfaces; `basicMarquee` single call site; `ForceSync` zero refs). Owner iterated on glass across the rounds ("main journey screen looks fantastic", final "the app looks good now") — the last round's commits (icon adjacency, operator name, chip colours, app-bar inset) are install-verified visually; a formal 22 mm ruler check on the tickers mid-scroll and a Lockito diversion pass at Tier A remain worth doing when convenient. Operator name requires one sync on the new build to populate (falls back to the wordmark line until then).
+
+**What's next:** The pilot — unchanged; owner-led iterative testing continues.
+
+**Banked / open:**
+- The workspace `pds-design-language` skill and `living/DESIGN-LANGUAGE.md` were both updated this session (toggle location, ephemera Android role, banner idiom, wordmark dashboard-only) — the Claude Design project cards still show the toggle in the panel header if anyone regenerates from them.
+- Tier B/C are unit-verified + emulator-exercisable (`adb shell wm size` sweeps) but have never been seen on real small-screen hardware — fine, no such hardware is deployed.
+- The 72 dp compact tube band constant was reasoned from the Canvas geometry, not yet eyeballed on an emulator at that height.
+- Owner asked about renaming the workspace folder — advised safe with a space-free name + a Claude-Code-memory caveat; owner decided to leave it as-is.
+- `.playwright-mcp` folders (workspace root + pds-dashboard) explained: transient Playwright MCP session artifacts, gitignored where it matters, deletable; relocatable via `--output-dir` if wanted.
