@@ -55,3 +55,13 @@ The identity: an Edwardian railway booking hall. Gelasio serif, ticket-stock das
 ## Voice
 
 Plain verbs, sentence case, specific over clever ("Save & render audio", "Rendered", "Contact your fleet manager…"). Errors say what happened and what to do. The register is a competent booking clerk: precise, unhurried, never cute.
+
+## Sync procedure — the design system lives in three places
+
+**Any change to the design language — tokens/colours, type, signature elements, component idioms, control placement, voice — updates all three copies in the same session:**
+
+1. **The skill** — workspace `.claude/skills/pds-design-language/SKILL.md` (the working copy Claude loads).
+2. **`pds-planning/living/DESIGN-LANGUAGE.md`** — the reference copy; body kept word-for-word identical to the skill (only the skill frontmatter / provenance header differ).
+3. **The "PDS Booking Hall" Claude Design project** (claude.ai/design, projectId `89aaa8cf-5142-44e3-ae7b-18e7b34ed8b3`) — update the affected card(s) with the DesignSync tool: `list_files` → `get_file` on the affected cards → `finalize_plan` → `write_files`. Cards are self-contained HTML sharing a common inline style block, each with a first-line `<!-- @dsCard group="…" -->` marker (keep it; no re-registration needed).
+
+A design change is not done until all three match. If the change touches what a binding repo rule mandates (dashboard Rule 16 / Android Rule 20), that rule is updated too, via the normal commit flow — the repo rules outrank all three copies.
