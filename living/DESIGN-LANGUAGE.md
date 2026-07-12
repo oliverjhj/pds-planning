@@ -25,7 +25,7 @@ The identity: an Edwardian railway booking hall. Gelasio serif, ticket-stock das
 | Flash / overlay (tablet) | deep-green ground, cream ink | wheat ground, deep-green ink (inversion) |
 | Tube-map (tablet) | completed `#B3BFAC` · upcoming `#79836F` · highlight `#2F5D43` | `#5C7260` · `#93A487` · `#A9C7AD` |
 
-**Never:** body text in gold/celadon-only; amber used decoratively; new raw hex values on branded surfaces — extend the token systems instead (dashboard: `globals.css` custom properties + `@theme` mapping; Android: a new `PassengerPalette` role defined in BOTH palettes + a `PassengerPaletteTest` assertion).
+**Never:** body text in gold/celadon-only; amber used decoratively or as a button/control accent (it is warnings-only); new raw hex values on branded surfaces — extend the token systems instead (dashboard: `globals.css` custom properties + `@theme` mapping; Android: a new `PassengerPalette` role defined in BOTH palettes + a `PassengerPaletteTest` assertion).
 
 ## Type
 
@@ -37,6 +37,7 @@ The identity: an Edwardian railway booking hall. Gelasio serif, ticket-stock das
 
 - **ticket-edge** — 1.5px dashed border; tables, cards, panels, ghost buttons. Dashboard utility class `ticket-edge`.
 - **stamp** — status badges: 3px double border, −3° rotation, letterspaced caps. Dashboard utility class `stamp`. **Dashboard/driver-side only.**
+- **Driver-panel buttons (tablet)** — SOLID filled, no border: every driver-control-panel button is a flat, small ~4dp-radius filled button so the panel reads as one uniform block. **Ink fill + ground text** (the ground↔ink inversion, "opposite of the background": `#E6DDBC` on `#0D2A1C` dark, `#2F5D43` on `#FAF6EA` light) for every control, with two solid-filled exceptions: *terminal* (End Journey) = **ephemera crimson**, and *Emergency-Mute-engaged* = **semantic amber** (the muted-state indicator). Amber is NEVER a generic button fill — only engaged-mute + the GPS-lost / speaker-disconnect markers. No dashed / ghost / outline on the driver panel (that ticket-edge ghost-button idiom is dashboard-side). Enforced by Android Rule 20.
 - **Serial Nº** — decorative mono "Nº ####" in ephemera red. Dashboard: digits derived from the entity UUID (`SerialNo` component), detail-page headers. Tablet: the route's operator-assigned number on the journey banner. On Android the red is the `ephemera` `PassengerPalette` role (both palettes, `PassengerPaletteTest`-guarded: ≥3:1 on the ground, hue outside the amber band).
 - **Wordmark** — "PDS" bold caps, `.14em` tracking. **Dashboard only** — the tablet's banner shows the operator's company name in mixed case instead (Reg 14(5)(a)).
 - **Journey banner band** (tablet, 2026-07-11) — a 56dp header strip on the passenger display: operator company name left (Gelasio, mixed case), route-number Nº right (ephemera mono), dashed ticket-edge bottom border (ink @ ~30%). It hosts the top-end control cluster and is what lets the regulated ticker lines below run full width; dropped at the smallest layout tier.
