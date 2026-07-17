@@ -1,0 +1,22 @@
+# Session: 2026-07-17 — Route-builder geofence warnings + pre-launch roadmap intake (second session)
+
+**What changed:** Dispositioned all four GPS-detection edge cases banked by the morning session. Analysed each against the actual detection core (`StopDetector.kt`, `StopDetectionInterpreter.kt`, `ProcessLocationFixUseCase.kt`, `ResolveStartPositionUseCase.kt`): (1) overlapping geofences and (4) the authoring note warranted a fix and were **built as one dashboard feature** — route-builder geofence warnings, live on production; (2) multi-stop skip and (3) duplicate-coordinate start-scan were **accepted as do-not-fix postures** (reasoning in STATE.md Bank and Assess). Also intook the owner's running to-do notes (design finalisation, announcement-wording guidance + ticker simulator, hardware guidance, business plan / go-to-market, final cybersecurity run) into STATE.md as **What's Left item 8**, so the next session can run a comprehensive roadmap review and sequence everything.
+
+**Commits:** pds-dashboard `e746638` — feat: warn on stop geofence overlap and duplicate locations in route builder. Pure helper `src/lib/utils/geofence.ts` (haversine mirrored from the tablet's `StopDetector.kt`, IUGG radius, so both surfaces judge distance identically) + `GeofenceWarnings` amber Alert (audio-warning-banner idiom, Rule 16) wired into `StopsList`, plus the repo's first `src/` vitest suite (13 cases). **Pushed by Claude at the owner's explicit instruction** after owner diff review and a local browser check — a one-off waiver of the human-push step; the gate itself is unchanged.
+
+**Decisions made:**
+- **Severe-only overlap threshold.** Warn iff consecutive-stop distance ≤ max(radiusA, radiusB) — a stop centre inside its neighbour's ring, the exact geometry that jams the departure gate or fires the look-ahead early. Mild ring overlap (centres outside each other's radius) is deliberately unflagged: traced as benign under the announce-on-departure model, and flagging it would fire on ordinary 200 m-default routes and bury the real warning.
+- **Non-blocking by design.** The warnings never gate saving (Rule 11 audio-warning posture — the operator may know better). Duplicate-coordinate detection is exact-equality (copied NaPTAN floats), any-pair; an exact-duplicate consecutive pair reports only as a duplicate.
+- **Edge case 2 accepted (no tablet change):** trigger is GPS outage, not speed (2 s cadence × 30 m/s = 60 m between fixes, inside any ≥80 m radius); the outage fires the 60 s GPS-lost warning, manual advance recovers; widening Rule 5's N/N+1 window would trade against the ledger-#31 hysteresis.
+- **Edge case 3 accepted (no tablet change):** only the one-time `findStartCandidate` scan is exposed; needs a self-crossing route AND a mid-route start at the shared point (return routes are separate generated routes); driver prompt + manual advance recover; the new duplicate warning flags it at authoring time.
+- **Owner-raised (banked into item 8, deliberately blocked on design finalisation):** announcement-wording guidance on the authoring page (screenshots of what shows where + the literal fixed-announcement texts) and a future ticker/marquee simulator (would a name overflow the 22 mm line on an X-sized screen). Technical anchor recorded: `tickerPlan` / `PhysicalTextMath` are pure and could be mirrored dashboard-side.
+
+**Verified:** 25 vitest tests green (13 new); `npm run lint` / `typecheck` / `build` green. Owner verified the banner locally in the browser ("works perfectly") before instructing the push. Vercel production deploy for `e746638` confirmed READY, aliased to `pds-dashboard.com`. No tablet code — no hardware verification applicable.
+
+**What's next:** ⚠️ Owner-requested: a **comprehensive roadmap review** — sequence item 7 (payment gate), the item-8 pre-launch intake (design/layout finalisation first; it gates the screenshot-bearing items), and the pilot into an execution order.
+
+**Banked / open:**
+- Item-8 intake is recorded raw and unprioritised in STATE.md — the sequencing IS the next session's job.
+- Dashboard `CLAUDE.md` not updated for this feature (Rule 6's route-builder feature list is generic; no rule or gotcha implicated) — fold a mention in on its next natural docs touch if wanted.
+- No design-system change (existing amber idiom reused) — no ledger-#27 three-way sync needed.
+- Working trees clean; both repos in sync with origin.
