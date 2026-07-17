@@ -1,61 +1,66 @@
-# PDS Design Language — "Booking Hall"
+# PDS Design Language — "Steelglass"
 
 > **Provenance:** reference copy of the `pds-design-language` skill (authoritative working copy:
 > workspace `.claude/skills/pds-design-language/SKILL.md` — kept in sync manually; if the two ever
 > diverge, the skill is what Claude actually loads, so fix the drift). Owner-signed-off and
-> glass-verified 2026-07-11. Living because the design language is current authority, not history.
+> glass-verified 2026-07-17. Living because the design language is current authority, not history.
 
-The identity: an Edwardian railway booking hall. Gelasio serif, ticket-stock dashed edges, rubber-stamp statuses, a crimson serial Nº, parchment by day and deep-green "Wheat" by night. Every UI addition to either repo must read as part of this system — never default-Material, never default-shadcn, never Inter-on-white.
+The identity: strictly neutral monochrome, machined glass. A near-black or pure-white canvas gradient, translucent glass panels with hairline borders and an inset top-highlight, Inter for UI, JetBrains Mono for data, and colour used only with intent — green means ready, amber means warning, red means failure or a terminal action. Every UI addition to either repo must read as part of this system — never default-Material, never default-shadcn, never decorative colour. (Supersedes "Booking Hall", 2026-07-17.)
 
-**Browsable reference:** the "PDS Booking Hall" project at claude.ai/design (12 rendered cards). **Binding repo rules:** pds-dashboard `CLAUDE.md` Rule 16, pds-android `CLAUDE.md` Rule 20 — where this file and a repo rule differ, the repo rule wins.
+**Browsable reference:** the "PDS Steelglass" project at claude.ai/design (12 rendered cards). **Binding repo rules:** pds-dashboard `CLAUDE.md` Rule 16, pds-android `CLAUDE.md` Rule 20 — where this file and a repo rule differ, the repo rule wins.
 
 ## Tokens
 
-| Role | Light (default: dashboard) | Wheat dark (default: tablet) |
+| Role | Dark "D2 near-black" (DEFAULT, both surfaces) | Light "L1 pure-white" |
 |---|---|---|
-| Ground | `#FAF6EA` | `#0D2A1C` |
-| Ink / body text | `#2F5D43` | `#E6DDBC` (wheat) |
-| Primary interactive | `#2F5D43` | `#A9C7AD` (celadon) |
-| Card / raised | `#FDFAF1` | `#123524` |
-| Table-header tint | `#F1ECD8` | `#123524` |
-| Muted text | `#79836F` | `#93A487` |
-| Ephemera (serial, stamps, H&R, destructive) | `#8C2F28` | `#CF6A55` |
-| Amber — SEMANTIC warnings only | `#8A5A00` on `#F2E6C8` | `#D9A441` on `#33290F` |
-| Borders | ink @ 32% alpha | wheat @ 28% alpha |
-| Flash / overlay (tablet) | deep-green ground, cream ink | wheat ground, deep-green ink (inversion) |
-| Tube-map (tablet) | completed `#B3BFAC` · upcoming `#79836F` · highlight `#2F5D43` | `#5C7260` · `#93A487` · `#A9C7AD` |
+| Canvas gradient (160°) | `#0A0A0A → #151515` | `#FFFFFF → #F6F6F6` |
+| Ground anchor (worst-contrast gradient end) | `#151515` | `#F6F6F6` |
+| Ink / body text | `#EAEAEA` | `#1C1C1C` |
+| Muted text | `#8F8F8F` | `#737373` |
+| Accent (tablet "Next stop" caption) | `#C9C9C9` | `#5C5C5C` |
+| Glass panel | white @ 5% + blur (web) | white @ 62% + blur (web) |
+| Border hairline | white @ 10% | black @ 10% |
+| Top highlight (sheen) | inset 1px white @ 7% | inset 1px white @ 70–85% |
+| Primary action | `#EAEAEA` fill, `#111111` text | `#1C1C1C` fill, `#FFFFFF` text |
+| OK / ready | `#4ADE80` | `#178344` |
+| Amber — SEMANTIC warnings only | `#FBBF24` | `#B45309` (hue watch-item: tune UP only) |
+| Failure / destructive | `#F87171` | `#C02626` |
+| Ephemera (terminal crimson — End Journey) | `#E5484D` | `#B3382E` |
+| Flash / overlay (tablet) | `#F0F0F0` ground, `#161616` ink (inversion) | `#161616` ground, `#F0F0F0` ink |
+| Tube-map (tablet) | completed `#4A4A4A` · upcoming `#8F8F8F` · highlight `#EAEAEA` | `#C7C7C7` · `#6B6B6B` · `#1C1C1C` |
+| Radius | 12px panels · 8–9px controls · 999px chips | same |
 
-**Never:** body text in gold/celadon-only; amber used decoratively or as a button/control accent (it is warnings-only); new raw hex values on branded surfaces — extend the token systems instead (dashboard: `globals.css` custom properties + `@theme` mapping; Android: a new `PassengerPalette` role defined in BOTH palettes + a `PassengerPaletteTest` assertion).
+**Never:** decorative colour of any kind (the palette is greys + the four semantic roles); amber used as a button/control accent (it is warnings-only, plus the engaged-mute fill); new raw hex values on branded surfaces — extend the token systems instead (dashboard: `globals.css` custom properties + `@theme` mapping; Android: a new `PassengerPalette` role defined in BOTH palettes + a `PassengerPaletteTest` assertion). The Android palette's `background` role is always the gradient's worst-contrast end, so contrast holds at every gradient point.
 
 ## Type
 
-- **Gelasio** (OFL) everywhere, weights 400/500/600/700. Dashboard: loaded via `next/font` onto `--font-sans`/`--font-heading` (+ italics). Android: `res/font/gelasio_*.ttf` via `PdsSerif` in `Type.kt`.
-- **Mono** (Courier Prime on web; platform mono on Android) for serials, NaPTAN codes, IDs — never body text.
-- Passenger text on the tablet sizes ONLY through `rememberPhysicalTextStyle` (22mm floor, cap height measured from Gelasio). Never a raw `sp` on a passenger-facing string.
+- **Inter** (OFL) everywhere, static weights 400/500/600/700. Dashboard: loaded via `next/font` onto `--font-sans`/`--font-heading`. Android: `res/font/inter_*.ttf` via `PdsSans` in `Type.kt` — static per-weight TTFs, never the variable font (the 22 mm cap-height measurement takes the minimum across the bundled weight resources).
+- **JetBrains Mono** (OFL) is the data voice — serials, versions, times, NaPTAN codes, route numbers, IDs — never body text. Dashboard: `--font-geist-mono` via `next/font`. Android: `res/font/jetbrains_mono_regular.ttf` via `PdsMono`.
+- Passenger text on the tablet sizes ONLY through `rememberPhysicalTextStyle` (22mm floor, cap height measured from Inter). Never a raw `sp` on a passenger-facing string.
 
 ## Signature elements (use them; don't invent parallel idioms)
 
-- **ticket-edge** — 1.5px dashed border; tables, cards, panels, ghost buttons. Dashboard utility class `ticket-edge`.
-- **stamp** — status badges: 3px double border, −3° rotation, letterspaced caps. Dashboard utility class `stamp`. **Dashboard/driver-side only.**
-- **Driver-panel buttons (tablet)** — SOLID filled, no border: every driver-control-panel button is a flat, small ~4dp-radius filled button so the panel reads as one uniform block. **Ink fill + ground text** (the ground↔ink inversion, "opposite of the background": `#E6DDBC` on `#0D2A1C` dark, `#2F5D43` on `#FAF6EA` light) for every control, with two solid-filled exceptions: *terminal* (End Journey) = **ephemera crimson**, and *Emergency-Mute-engaged* = **semantic amber** (the muted-state indicator). Amber is NEVER a generic button fill — only engaged-mute + the GPS-lost / speaker-disconnect markers. No dashed / ghost / outline on the driver panel (that ticket-edge ghost-button idiom is dashboard-side). Enforced by Android Rule 20.
-- **Serial Nº** — decorative mono "Nº ####" in ephemera red. Dashboard: digits derived from the entity UUID (`SerialNo` component), detail-page headers. Tablet: the route's operator-assigned number on the journey banner. On Android the red is the `ephemera` `PassengerPalette` role (both palettes, `PassengerPaletteTest`-guarded: ≥3:1 on the ground, hue outside the amber band).
-- **Wordmark** — "PDS" bold caps, `.14em` tracking. **Dashboard only** — the tablet's banner shows the operator's company name in mixed case instead (Reg 14(5)(a)).
-- **Journey banner band** (tablet, 2026-07-11) — a 56dp header strip on the passenger display: operator company name left (Gelasio, mixed case), route-number Nº right (ephemera mono), dashed ticket-edge bottom border (ink @ ~30%). It hosts the top-end control cluster and is what lets the regulated ticker lines below run full width; dropped at the smallest layout tier.
-- **Mode toggle** — the half-light/half-dark circle (inline SVG on web, Canvas `drawArc` on Android). Dashboard header (cookie `pds-theme`, read server-side — never a pre-hydration script) and, since 2026-07-11, the tablet's **app-wide top-end control cluster** beside the admin gear (`presentation/common/ThemeToggleButton`; `DisplayThemeStore`, default dark) — no longer in the driver-panel header. Cluster chips draw from the Material scheme (surfaceContainerHigh disc, outlineVariant ring, primary glyphs) — never raw black/white.
-- Radius stays small (0.25rem web / 2–4dp feel) — ticket stock, not bubbles.
+- **Canvas gradient** — every screen floats on the 160° wash. Dashboard: painted on `body` in `@layer base` (fixed attachment). Android: `Modifier.steelglassCanvas(palette)` from `ui/theme/Steelglass.kt` — painted once at MainActivity's root for Material screens (their Scaffolds are containerColor-transparent) and at the passenger/journey roots. Never hand-roll the gradient.
+- **glass-panel** — the translucent machined panel: card ground + 1px hairline border + inset top-highlight + backdrop blur (blur is web-only progressive enhancement; Android uses translucency without blur by design — no blur dependency). Dashboard utility class `glass-panel` (`--card` is translucent, so shadcn Cards are glass by construction). Android: `SteelglassPanel` in `ui/theme/Steelglass.kt` for decorative in-screen panels only — full-screen driver overlays keep the near-opaque `panelSurface`, and Material dialogs/sheets stay opaque scheme surfaces.
+- **chip** — status pills: 1px hairline border in `currentColor`, full radius, letterspaced caps. Dashboard utility class `chip`. **Dashboard/driver-side only** (passenger surfaces stay mixed case).
+- **Driver-panel buttons (tablet)** — SOLID filled, no border: every driver-control-panel button is a flat, small-radius filled button so the panel reads as one uniform block. **Ink fill + ground text** (the ground↔ink inversion: light-on-near-black dark, near-black-on-light light) for every control, with two solid-filled exceptions: *terminal* (End Journey) = **ephemera crimson**, and *Emergency-Mute-engaged* = **semantic amber** (the muted-state indicator). Amber is NEVER a generic button fill — only engaged-mute + the GPS-lost / speaker-disconnect markers. No dashed / ghost / outline on the driver panel; dashes in the passenger region are `TubeMapView`'s hail-and-ride semantics only. Enforced by Android Rule 20.
+- **Mono data voice** — anywhere a serial, version, timestamp, count, or route number appears, it renders in the mono face, usually muted. This replaces the retired serial-Nº ornament: real identifiers only, no decorative digits.
+- **Wordmark** — "PDS" bold, `.14em` tracking. **Dashboard only** — the tablet's banner shows the operator's company name in mixed case instead (Reg 14(5)(a)).
+- **Journey banner band** (tablet) — a 56dp header strip on the passenger display: operator company name left (Inter, mixed case), route number right (`PdsMono`, muted), solid 1px `glassBorder` bottom hairline. It hosts the top-end control cluster and is what lets the regulated ticker lines below run full width; dropped at the smallest layout tier.
+- **Mode toggle** — the half-light/half-dark circle (inline SVG on web, Canvas `drawArc` on Android). Dashboard header (cookie `pds-theme`, read server-side — never a pre-hydration script; **absent cookie = dark**) and the tablet's app-wide top-end control cluster beside the admin gear (`presentation/common/ThemeToggleButton`; `DisplayThemeStore`, default dark). Cluster chips draw from the Material scheme — never raw black/white constants.
 
 ## Compliance constraints the design must never break (tablet passenger surface)
 
 1. **Mixed case only** — Reg 14(5)(a). No `text-transform: uppercase`, no `uppercase()`, no small caps on anything a passenger reads. Caps live on the dashboard.
 2. **≥22mm physical text** — Reg 14(4). Route name, stop name, announcement text all go through the PhysicalText machinery; never truncate, grow line count instead.
-3. **Contrast** — Reg 14(5)(b). Ink/ground ≥7:1 (both palettes are; `PassengerPaletteTest` guards it).
+3. **Contrast** — Reg 14(5)(b). Ink/ground ≥7:1 at BOTH gradient ends (both palettes are; `PassengerPaletteTest` guards `background` and `backgroundDeep`).
 4. **Amber is semantic** — GPS-lost, speaker-disconnect, and mute markers are amber in every theme.
-5. **Announcement flash/overlay** — colors come from the palette (`flashFill`, `overlayBackground/-OnBackground`); the 500ms/8s timing, chime simultaneity, and audio-independence belong to `RegulatedAnnouncementCoordinator` and are untouchable from design work.
-6. Passenger colors flow only through `LocalPassengerPalette` — never new top-level constants.
+5. **Announcement flash/overlay** — colors come from the palette (`flashFill`, `overlayBackground/-OnBackground`, always alpha-1); the 500ms/8s timing, chime simultaneity, and audio-independence belong to `RegulatedAnnouncementCoordinator` and are untouchable from design work.
+6. Passenger colors flow only through `LocalPassengerPalette` — never new top-level constants; Steelglass surfaces flow only through the `Steelglass.kt` helpers.
 
 ## Voice
 
-Plain verbs, sentence case, specific over clever ("Save & render audio", "Rendered", "Contact your fleet manager…"). Errors say what happened and what to do. The register is a competent booking clerk: precise, unhurried, never cute.
+Plain verbs, sentence case, specific over clever ("Save & render audio", "Rendered", "Contact your fleet manager…"). Errors say what happened and what to do. The register is a precision instrument: calm, exact, never cute.
 
 ## Sync procedure — the design system lives in three places
 
@@ -63,6 +68,6 @@ Plain verbs, sentence case, specific over clever ("Save & render audio", "Render
 
 1. **The skill** — workspace `.claude/skills/pds-design-language/SKILL.md` (the working copy Claude loads).
 2. **`pds-planning/living/DESIGN-LANGUAGE.md`** — the reference copy; body kept word-for-word identical to the skill (only the skill frontmatter / provenance header differ).
-3. **The "PDS Booking Hall" Claude Design project** (claude.ai/design, projectId `89aaa8cf-5142-44e3-ae7b-18e7b34ed8b3`) — update the affected card(s) with the DesignSync tool: `list_files` → `get_file` on the affected cards → `finalize_plan` → `write_files`. Cards are self-contained HTML sharing a common inline style block, each with a first-line `<!-- @dsCard group="…" -->` marker (keep it; no re-registration needed).
+3. **The "PDS Steelglass" Claude Design project** (claude.ai/design, projectId `89aaa8cf-5142-44e3-ae7b-18e7b34ed8b3`) — update the affected card(s) with the DesignSync tool: `list_files` → `get_file` on the affected cards → `finalize_plan` → `write_files`. Cards are self-contained HTML sharing a common inline style block, each with a first-line `<!-- @dsCard group="…" -->` marker (keep it; no re-registration needed).
 
 A design change is not done until all three match. If the change touches what a binding repo rule mandates (dashboard Rule 16 / Android Rule 20), that rule is updated too, via the normal commit flow — the repo rules outrank all three copies.
