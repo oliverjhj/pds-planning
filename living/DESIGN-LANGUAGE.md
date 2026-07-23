@@ -7,7 +7,7 @@
 
 The identity: strictly neutral monochrome, machined glass. A near-black or pure-white canvas gradient, translucent glass panels with hairline borders and an inset top-highlight, Inter for UI, JetBrains Mono for data, and colour used only with intent — green means ready, amber means warning, red means failure or a terminal action. Every UI addition to either repo must read as part of this system — never default-Material, never default-shadcn, never decorative colour. (Supersedes "Booking Hall", 2026-07-17.)
 
-**Browsable reference:** the "PDS Steelglass" project at claude.ai/design (12 rendered cards). **Binding repo rules:** pds-dashboard `CLAUDE.md` Rule 16, pds-android `CLAUDE.md` Rule 20 — where this file and a repo rule differ, the repo rule wins.
+**Browsable reference:** the "PDS Steelglass" project at claude.ai/design (14 rendered cards). **Binding repo rules:** pds-dashboard `CLAUDE.md` Rule 16, pds-android `CLAUDE.md` Rule 20 — where this file and a repo rule differ, the repo rule wins.
 
 ## Tokens
 
@@ -49,6 +49,14 @@ The identity: strictly neutral monochrome, machined glass. A near-black or pure-
 - **Wordmark** — "PDS" bold, `.14em` tracking. **Dashboard only** — the tablet's banner shows the operator's company name in mixed case instead (Reg 14(5)(a)).
 - **Journey banner band** (tablet) — a 56dp header strip on the passenger display: operator company name left (Inter, mixed case), solid 1px `glassBorder` bottom hairline. It hosts the top-end control cluster and is what lets the regulated ticker lines below run full width; dropped at the smallest layout tier. **The band carries no route identifier** — the route designation leads the regulated route line directly below it, and showing it in both places was the same value twice, two rows apart (2026-07-18).
 - **Mode toggle** — the half-light/half-dark circle (inline SVG on web, Canvas `drawArc` on Android). Dashboard header (cookie `pds-theme`, read server-side — never a pre-hydration script; **absent cookie = dark**) and the tablet's app-wide top-end control cluster beside the admin gear (`presentation/common/ThemeToggleButton`; `DisplayThemeStore`, default dark). Cluster chips draw from the Material scheme — never raw black/white constants.
+
+## Interaction & affordance
+
+Clickable things look clickable, respond when used, and inactive things don't. This is the principle — the cursor rule below is one worked example of it, not the whole of it.
+
+- **Affordance & feedback.** Every interactive control advertises itself and responds. On the dashboard that is a pointer cursor from **one base-layer rule** in `globals.css` (covering `button`, `[role="switch"]`, radio/checkbox and their wrapping labels — never patched per-component; dashboard Rule 16) plus hover/pressed feedback; on the tablet it is a generous touch target and the driver panel's brief press confirmation. A CSS rule can only reach what the browser already knows is interactive, so **a clickable `<div>` with no `<button>` and no `role` is invisible to it *and* to assistive tech** — make such a row a real `<button>`/`<a>`, or give it `role="button"` + `tabIndex={0}` + a key handler, so affordance and accessibility hold together.
+- **Focus-visible.** Keyboard focus is always visible — a focus ring on every dashboard control (shadcn's `focus-visible:ring`, never stripped). A pointer-and-keyboard concern only: the tablet is a touch kiosk with no focus traversal.
+- **Disabled never advertises a click.** A disabled control drops the pointer cursor (the base rule excludes `:disabled` / `[data-disabled]`) and reads as plainly inactive, never as enabled. On the tablet's driver panel, disabled buttons are the **same solid fill, faded** — never a border or grey swap (Android Rule 20).
 
 ## Compliance constraints the design must never break (tablet passenger surface)
 
