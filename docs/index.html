@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Passenger Display System — case study</title>
+<meta name="description" content="A UK PSVAR 2023-compliant passenger information system for rail-replacement buses: Android tablet, operator dashboard, Postgres backend. Built, deployed, and operated in production.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  /* Steelglass — the product's own design language, dark "D2 near-black". */
+  :root{
+    --deep:#0A0A0A; --ground:#151515;
+    --ink:#EAEAEA; --muted:#8F8F8F; --accent:#C9C9C9;
+    --glass:rgba(255,255,255,.05);
+    --hairline:rgba(255,255,255,.10);
+    --sheen:rgba(255,255,255,.07);
+    --ok:#4ADE80; --warn:#FBBF24;
+    --sans:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; padding:0; min-height:100vh;
+    font-family:var(--sans); font-size:17px; line-height:1.65;
+    color:var(--ink);
+    background:var(--ground);
+    background-image:linear-gradient(160deg,var(--deep) 0%,var(--ground) 100%);
+    background-attachment:fixed;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:780px;margin:0 auto;padding:clamp(2.5rem,7vw,5rem) clamp(1.1rem,5vw,2rem) 6rem}
+  h1,h2,h3{line-height:1.2;letter-spacing:-.015em;font-weight:600;margin:0}
+  h1{font-size:clamp(1.9rem,5.5vw,2.7rem);font-weight:700;letter-spacing:-.025em}
+  h2{font-size:clamp(1.25rem,3.4vw,1.5rem);margin:4rem 0 .35rem}
+  h3{font-size:1.02rem;font-weight:600;margin:0 0 .4rem}
+  p{margin:.9rem 0}
+  a{color:var(--ink);text-decoration:none;border-bottom:1px solid var(--hairline)}
+  a:hover{border-bottom-color:var(--ink)}
+  a:focus-visible{outline:2px solid var(--ink);outline-offset:3px;border-radius:2px}
+  strong{font-weight:600}
+  code,.mono{font-family:var(--mono);font-size:.88em}
+  .lede{font-size:clamp(1.05rem,2.6vw,1.19rem);color:var(--accent);margin-top:1.1rem}
+  .muted{color:var(--muted)}
+  .rule{height:1px;background:var(--hairline);border:0;margin:3.5rem 0 0}
+  .kicker{font-family:var(--mono);font-size:.72rem;letter-spacing:.16em;text-transform:uppercase;
+          color:var(--muted);margin:0 0 .9rem}
+  /* status chips */
+  .status{display:flex;flex-wrap:wrap;gap:.45rem;margin:1.7rem 0 0;padding:0;list-style:none}
+  .status li{font-family:var(--mono);font-size:.74rem;letter-spacing:.05em;color:var(--muted);
+             border:1px solid var(--hairline);border-radius:999px;padding:.3rem .72rem}
+  .status li.live{color:var(--ink)}
+  /* glass panel */
+  .panel{position:relative;background:var(--glass);border:1px solid var(--hairline);
+         border-radius:12px;padding:1.35rem 1.5rem;overflow:hidden}
+  .panel::before{content:"";position:absolute;top:0;left:1px;right:1px;height:1px;background:var(--sheen)}
+  .stack{display:grid;gap:1rem;margin:1.6rem 0}
+  /* figures grid */
+  .figs{display:grid;grid-template-columns:1fr;gap:2rem;margin:1.8rem 0}
+  figure{margin:0}
+  figure .shot{background:var(--glass);border:1px solid var(--hairline);border-radius:12px;
+               overflow:hidden;line-height:0;padding:0;display:flex;justify-content:center}
+  figure img{max-width:100%;height:auto;display:block;margin:0 auto}
+  figcaption{font-size:.87rem;color:var(--muted);margin-top:.7rem;line-height:1.6;max-width:60ch}
+  /* numbers row */
+  .nums{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:.75rem;margin:1.6rem 0}
+  .num{background:var(--glass);border:1px solid var(--hairline);border-radius:12px;padding:.9rem 1rem;
+       position:relative;overflow:hidden}
+  .num::before{content:"";position:absolute;top:0;left:1px;right:1px;height:1px;background:var(--sheen)}
+  .num b{display:block;font-family:var(--mono);font-size:1.32rem;font-weight:500;letter-spacing:-.02em}
+  .num span{display:block;font-size:.78rem;color:var(--muted);margin-top:.15rem;line-height:1.4}
+  /* the clause example */
+  .clause{font-family:var(--mono);font-size:.83rem;line-height:1.7;overflow-x:auto}
+  .clause div{white-space:nowrap;padding:.15rem 0}
+  .clause .lbl{color:var(--muted)}
+  blockquote{margin:1.4rem 0;padding-left:1.1rem;border-left:2px solid var(--hairline);
+             color:var(--accent);font-size:1.02rem}
+  footer{margin-top:4.5rem;padding-top:1.6rem;border-top:1px solid var(--hairline);
+         font-size:.9rem;color:var(--muted)}
+  footer a{color:var(--accent)}
+  ul.tight{padding-left:1.1rem;margin:.9rem 0}
+  ul.tight li{margin:.4rem 0}
+</style>
+</head>
+<body>
+<main class="wrap">
+
+  <p class="kicker">Case study</p>
+  <h1>Passenger Display System</h1>
+  <p class="lede">A legally-regulated passenger information system for UK rail-replacement buses — an
+  Android tablet, an operator dashboard, and a shared Postgres backend. Built against
+  <strong>The Public Service Vehicles (Accessible Information) Regulations 2023</strong>, deployed,
+  and operated in production.</p>
+
+  <ul class="status">
+    <li>Planned Mar–May 2026</li>
+    <li>Built May–Jul 2026</li>
+    <li class="live">Ran in production</li>
+    <li>Commercial track closed Jul 2026</li>
+    <li>Since decommissioned</li>
+  </ul>
+
+  <hr class="rule">
+
+  <h2>The regulations came first</h2>
+  <p>Before any production code existed, the statutory instrument was mapped onto product
+  requirements — <strong>36 individual clauses across eight regulations</strong>, at sub-clause
+  granularity, each one row in a five-column table.</p>
+
+  <div class="panel clause">
+    <div><span class="lbl">Reg. Clause &nbsp;·&nbsp;</span> 8(2)</div>
+    <div><span class="lbl">Requirement &nbsp;·&nbsp;</span> Termination information must be immediately preceded by an alert</div>
+    <div><span class="lbl">PDS Feature &nbsp;·&nbsp;</span> Chime, then a 500 ms full-screen flash, then the announcement overlay</div>
+    <div><span class="lbl">Responsibility &nbsp;·&nbsp;</span> Software</div>
+    <div><span class="lbl">PRD Reference &nbsp;·&nbsp;</span> FR-AT-24, FR-AT-27, FR-AT-65</div>
+  </div>
+
+  <p>Three things in that document matter more than the mapping itself.</p>
+
+  <div class="stack">
+    <div class="panel">
+      <h3>It records what software cannot do</h3>
+      <p class="muted" style="margin:0">Every clause is classified <span class="mono">Software</span>,
+      <span class="mono">Operator</span> or <span class="mono">Hardware</span>, and a separate
+      18-row boundary summary exists to support operator contracts and liability. The system provides a
+      per-device audio toggle, but it cannot enforce one audio device per bus — it has no concept of a
+      vehicle. That is written down rather than glossed over.</p>
+    </div>
+    <div class="panel">
+      <h3>A legal threshold was measured, not assumed</h3>
+      <p class="muted" style="margin:0">Regulation 13(4) requires announcement audio to sit within
+      300–3000 Hz. Rather than assume the rendered speech complied, its spectrum was analysed —
+      a Welch power-spectral-density estimate found <span class="mono">63.8%</span> of total energy
+      inside the required band, with the method and library versions recorded in the row itself.</p>
+    </div>
+    <div class="panel">
+      <h3>It argues with itself, and loses</h3>
+      <p class="muted" style="margin:0">A quarter of the document is its own changelog — nine
+      revisions across three adversarial review rounds. One entry records a row being
+      <em>rewritten to drop the dishonest claim that the software prevents overlapping multi-tablet
+      audio</em>. Finding that before the build is the entire point of doing it first.</p>
+    </div>
+  </div>
+
+  <hr class="rule">
+
+  <h2>What was built</h2>
+
+  <div class="nums">
+    <div class="num"><b>24</b><span>Postgres migrations</span></div>
+    <div class="num"><b>9</b><span>Edge Functions</span></div>
+    <div class="num"><b>8 / 8</b><span>tables RLS-scoped</span></div>
+    <div class="num"><b>375,730</b><span>NaPTAN stops</span></div>
+  </div>
+
+  <p><strong>The tablet</strong> (Kotlin, Compose, Hilt, Room) runs kiosk-mode, offline-first and
+  GPS-driven. It detects stops by per-stop geofence with an accuracy gate and a temporal-hysteresis
+  confirmation layer, plays pre-rendered audio, and drives a passenger display whose text is sized by
+  physical measurement. It authors nothing and synthesises nothing — those concerns live elsewhere by
+  design.</p>
+
+  <p><strong>The dashboard</strong> (Next.js) is where operators author routes against the full UK
+  stop database, manage a tablet fleet, and read journeys back. <strong>The backend</strong>
+  (Supabase/Postgres) carries a <span class="mono">pg_boss</span>-queued render pipeline that
+  synthesises every announcement server-side, and has been multi-tenant since its first migration,
+  with operator scope carried as a JWT custom claim.</p>
+
+  <hr class="rule">
+
+  <h2>Four decisions worth defending</h2>
+
+  <div class="stack">
+    <div class="panel">
+      <h3>Announce on departure, not on arrival</h3>
+      <p class="muted" style="margin:0">Arrival at a stop arms the announcement; departure fires it.
+      The obvious implementation announces the next stop when the bus reaches the current one — which
+      tells passengers where they already are. Getting this right needed the regulation read for
+      intent, not just for keywords.</p>
+    </div>
+    <div class="panel">
+      <h3>The visual half is co-equal with the audio</h3>
+      <p class="muted" style="margin:0">A regulated announcement's screen flash and text overlay fire
+      <em>even on a tablet with audio disabled</em>, because the law mandates a combined alert and does
+      not exempt silent units. The flash therefore runs on its own timeline rather than being triggered
+      by the chime — coupling them would have meant a silent tablet never flashed. It is an
+      architectural invariant, not a UI preference.</p>
+    </div>
+    <div class="panel">
+      <h3>Passenger text is 22 mm, physically</h3>
+      <p class="muted" style="margin:0">The regulation specifies millimetres, not pixels. Font size is
+      derived from a cap-height fraction measured from the bundled typeface, against a screen
+      calibrated by holding a bank card to it — because budget tablets misreport their own DPI. Long
+      stop names scroll horizontally; they never shrink below the floor and never truncate.</p>
+    </div>
+    <div class="panel">
+      <h3>Audit the deployed shape, don't trust the spec</h3>
+      <p class="muted" style="margin:0">A standing discipline: before building against any deployed
+      function, RPC or schema, check what it actually is in production. It repeatedly caught real
+      divergences — including an audio-path derivation defect where the specified mechanism would have
+      produced paths that 404 against live data.</p>
+    </div>
+  </div>
+
+  <hr class="rule">
+
+  <h2>It ran in production</h2>
+  <p>Not a prototype and not a localhost demo. It was deployed, monitored, and operated — which is the
+  half of a project that is usually hardest to evidence after the fact.</p>
+
+  <div class="figs">
+    <figure>
+      <div class="shot"><img src="images/migrations.png" alt="Supabase migration list showing dated schema migrations from May to July 2026"></div>
+      <figcaption>24 migrations, applied in order across three months. No hand-edited production schema — verified by digest against a second, independently provisioned environment.</figcaption>
+    </figure>
+    <figure>
+      <div class="shot"><img src="images/edge-functions.png" alt="Supabase Edge Functions list showing nine deployed functions"></div>
+      <figcaption>Nine Edge Functions — device pairing and recovery, the render queue and its worker, audio cleanup, auto-deregistration, account deletion.</figcaption>
+    </figure>
+    <figure>
+      <div class="shot"><img src="images/rls-policies.png" alt="Supabase row-level-security policy list showing named per-table policies"></div>
+      <figcaption>Row-level security on every table, with separate policies for dashboard users and paired devices. Multi-tenancy from the first migration, not retrofitted.</figcaption>
+    </figure>
+    <figure>
+      <div class="shot"><img src="images/sentry-projects.png" alt="Sentry project list showing android, dashboard and edge-functions projects"></div>
+      <figcaption>Error monitoring on all three surfaces — tablet, dashboard and backend — with personally identifying data stripped before send.</figcaption>
+    </figure>
+  </div>
+
+  <p>Compliance-critical arithmetic was deliberately isolated into pure, unit-tested helpers — text
+  sizing, layout-tier degradation, the volume floor, PIN lockout backoff — so the rules that carry legal
+  weight could be tested without a device attached. Anything touching announcements, GPS or the
+  passenger display was then verified on real hardware before it counted as done.</p>
+
+  <hr class="rule">
+
+  <h2>Why it closed</h2>
+  <p>The opening was real: new accessibility regulations were about to compel passenger information
+  systems onto fleets, and the market offered integrated hardware at roughly £5,000 a vehicle. Selling
+  the software alone, on operators' own off-the-shelf tablets, undercut that substantially.</p>
+
+  <p>By the time it was finished, the prospective first customer had committed their compliance budget
+  to the premium integrated option — and the reason mattered more than the loss. Operators treating
+  compliance as a capital purchase were not price-shopping at all, and the ones who would have been
+  were too price-sensitive to build a business on. The commercial track was closed in July 2026.</p>
+
+  <blockquote>The engineering did not fail. The distribution did.</blockquote>
+
+  <hr class="rule">
+
+  <h2>The record</h2>
+  <p>The planning repository is public: the compliance matrix, the frozen requirements and data
+  architecture documents, a 45-entry decision ledger, and 38 dated session records covering what
+  changed, what was decided, and what was verified on hardware.</p>
+
+  <ul class="tight">
+    <li><a href="https://github.com/oliverjhj/pds-planning">github.com/oliverjhj/pds-planning</a> — the full record</li>
+    <li><a href="https://github.com/oliverjhj/pds-planning/blob/main/historical/Compliance-Mapping-Matrix.md">The compliance mapping matrix</a> — the artefact to read first</li>
+  </ul>
+
+  <p class="muted" style="font-size:.9rem">Place names and route numbers throughout the repository are
+  fictional. The pilot was a personal contact at a bus operator, and their commercial data was replaced
+  with a fictional operator and removed from the repository's history before publication.</p>
+
+  <footer>
+    <p>The dashboard ran at pds-dashboard.com until the infrastructure was decommissioned.
+    Application source for the tablet and dashboard remains private.</p>
+  </footer>
+
+</main>
+</body>
+</html>
