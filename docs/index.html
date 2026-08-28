@@ -83,6 +83,15 @@
   footer a{color:var(--accent)}
   ul.tight{padding-left:1.1rem;margin:.9rem 0}
   ul.tight li{margin:.4rem 0}
+  /* primary action — the one filled control on the page */
+  .vid{margin:2.2rem 0 0}
+  .vid h3{margin-bottom:.5rem}
+  .btn{display:inline-block;margin:1.1rem 0 .6rem;padding:.62rem 1.15rem;border-radius:9px;
+       background:var(--ink);color:#111111;font-weight:600;font-size:.94rem;
+       border:0;text-decoration:none;line-height:1.3}
+  .btn:hover{background:#fff;border:0}
+  .btn:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
+  .meta{font-family:var(--mono);font-size:.76rem;color:var(--muted);margin:0}
 </style>
 </head>
 <body>
@@ -102,6 +111,15 @@
     <li>Commercial track closed Jul 2026</li>
     <li>Since decommissioned</li>
   </ul>
+
+  <div class="panel vid">
+    <h3>Watch it running</h3>
+    <p class="muted" style="margin:.2rem 0 0">A five-minute walkthrough of the operator dashboard,
+    a tablet pairing itself to a fleet, and the tablet running a service — recorded against the live
+    production system shortly before it was decommissioned.</p>
+    <a class="btn" href="https://github.com/oliverjhj/pds-planning/releases/download/demo-video/pds-demo.mp4">Download the demo video</a>
+    <p class="meta">MP4 &nbsp;·&nbsp; 4 min 59 s &nbsp;·&nbsp; 92 MB &nbsp;·&nbsp; downloads rather than streams</p>
+  </div>
 
   <hr class="rule">
 

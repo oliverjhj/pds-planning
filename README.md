@@ -121,5 +121,10 @@ domain can be registered by anyone.
 
 ## The product, running
 
-A short video walkthrough of the tablet and the dashboard, and a one-page case study, accompany this
-repository. *(Links to be added when published.)*
+**[Watch the demo video](https://github.com/oliverjhj/pds-planning/releases/download/demo-video/pds-demo.mp4)** —
+a five-minute walkthrough of the operator dashboard, a tablet pairing itself to a fleet, and the
+tablet running a service, recorded against the live production system before it was decommissioned.
+MP4, 92 MB; it downloads rather than streaming.
+
+**[Read the case study](https://oliverjhj.github.io/pds-planning/)** — a one-page summary of what was
+built, four decisions worth defending, and the evidence that it ran in production.
